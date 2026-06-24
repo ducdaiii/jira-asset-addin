@@ -41,6 +41,7 @@ const CFG_KEYS = {
   WORKSPACE_ID: "workspaceId",
   PROJECT_KEY:  "projectKey",
   WORKER_URL:   "workerUrl",
+  AQL_QUERY:    "aqlQuery",
   LAST_SYNC:    "lastSync",
 };
 
@@ -72,6 +73,7 @@ function loadConfig() {
     workspaceId: s.get(CFG_KEYS.WORKSPACE_ID)  || "",
     projectKey:  s.get(CFG_KEYS.PROJECT_KEY)   || "IT",
     workerUrl:   s.get(CFG_KEYS.WORKER_URL)    || "",
+    aqlQuery:    s.get(CFG_KEYS.AQL_QUERY)     || "objectTypeId IN (525,527,529)",
     lastSync:    s.get(CFG_KEYS.LAST_SYNC)     || null,
   };
   updateWorkspaceLabel();
@@ -97,6 +99,7 @@ function saveConfig() {
   cfg.workspaceId = getVal("cfg-workspace-id");
   cfg.projectKey  = getVal("cfg-project-key");
   cfg.workerUrl   = getVal("cfg-worker-url");
+  cfg.aqlQuery    = getVal("cfg-aql-query");
   s.set(CFG_KEYS.JIRA_URL,     cfg.jiraUrl);
   s.set(CFG_KEYS.EMAIL,        cfg.email);
   s.set(CFG_KEYS.TOKEN,        cfg.token);
@@ -104,6 +107,7 @@ function saveConfig() {
   s.set(CFG_KEYS.WORKSPACE_ID, cfg.workspaceId);
   s.set(CFG_KEYS.PROJECT_KEY,  cfg.projectKey);
   s.set(CFG_KEYS.WORKER_URL,   cfg.workerUrl);
+  s.set(CFG_KEYS.AQL_QUERY,    cfg.aqlQuery);
   s.saveAsync(() => {
     updateWorkspaceLabel();
     toast("Settings saved", "success");
@@ -118,6 +122,7 @@ function populateConfigUI() {
   setVal("cfg-workspace-id",  cfg.workspaceId);
   setVal("cfg-project-key",   cfg.projectKey);
   setVal("cfg-worker-url",    cfg.workerUrl);
+  setVal("cfg-aql-query",     cfg.aqlQuery);
 
 }
 
@@ -232,17 +237,19 @@ async function assetsPost(path, body) {
 }
 
 // ── Fetch all assets via AQL pagination ──────────────────────
-// Endpoint: POST /object/aql?startAt=0&maxResults=50
+// Endpoint: POST /object/aql  (params trong body, không phải query string)
 async function fetchJiraAssets() {
   const assets = [];
   let startAt = 0;
   const pageSize = 50;
 
   while (true) {
-    const data = await assetsPost(
-      `/object/aql?startAt=${startAt}&maxResults=${pageSize}&includeAttributes=true`,
-      { qlQuery: "objectType != null" }   // fetch all objects in workspace
-    );
+    const data = await assetsPost("/object/aql", {
+      qlQuery:           cfg.aqlQuery || "objectTypeId IN (525,527,529)",
+      startAt:           startAt,
+      maxResults:        pageSize,
+      includeAttributes: true,
+    });
 
     const values = data.values || [];
     values.forEach(obj => {
