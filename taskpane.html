@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Jira Asset Manager</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <style>
+    /* ── TOKENS ── */
+    :root {
+      --bg:         #0f1117;
+      --surface:    #1a1d27;
+      --surface2:   #22263a;
+      --border:     #2e3350;
+      --accent:     #4f8ef7;
+      --accent-dim: #1e3a6e;
+      --green:      #22c55e;
+      --yellow:     #f59e0b;
+      --red:        #ef4444;
+      --red-dim:    #4a1212;
+      --text:       #e8eaf0;
+      --muted:      #8892a4;
+      --tag-jira:   #1e3a6e;
+      --tag-local:  #1a3a1a;
+      --radius:     6px;
+      --font:       'Segoe UI', system-ui, sans-serif;
+      --mono:       'Cascadia Code', 'Consolas', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      font-size: 13px;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── HEADER ── */
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 14px 0;
+      flex-shrink: 0;
+    }
+    .header-top {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .logo {
+      width: 22px; height: 22px;
+      background: var(--accent);
+      border-radius: 4px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; color: #fff; flex-shrink: 0;
+    }
+    .header-title { font-size: 13px; font-weight: 600; color: var(--text); }
+    .header-ws {
+      margin-left: auto;
+      font-size: 10px;
+      color: var(--muted);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 2px 8px;
+    }
+
+    /* ── TABS ── */
+    .tabs {
+      display: flex;
+      gap: 2px;
+    }
+    .tab {
+      flex: 1;
+      padding: 7px 4px;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--muted);
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color .15s, border-color .15s;
+      text-align: center;
+      white-space: nowrap;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    /* ── PANELS ── */
+    .panels { flex: 1; overflow-y: auto; padding: 14px; }
+    .panel { display: none; flex-direction: column; gap: 12px; }
+    .panel.active { display: flex; }
+
+    /* ── STAT GRID ── */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+    }
+    .stat-label {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      margin-bottom: 4px;
+    }
+    .stat-value {
+      font-size: 22px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      line-height: 1;
+    }
+    .stat-value.warn { color: var(--yellow); }
+    .stat-value.err  { color: var(--red); }
+    .stat-value.ok   { color: var(--green); }
+
+    /* ── SYNC INFO ── */
+    .sync-bar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .sync-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0;
+    }
+    .sync-dot.syncing {
+      background: var(--yellow);
+      animation: pulse 1s ease infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .sync-time { margin-left: auto; color: var(--text); font-weight: 500; }
+
+    /* ── BUTTONS ── */
+    .btn {
+      border: none;
+      border-radius: var(--radius);
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 8px 14px;
+      transition: opacity .15s, background .15s;
+    }
+    .btn:hover { opacity: .85; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-outline {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+    }
+    .btn-danger { background: var(--red); color: #fff; }
+    .btn-block { width: 100%; text-align: center; }
+    .btn-group { display: flex; gap: 8px; }
+    .btn-sm { padding: 5px 10px; font-size: 11px; }
+
+    /* ── SECTION HEADER ── */
+    .section-head {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted);
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* ── VALIDATION LIST ── */
+    .val-list { display: flex; flex-direction: column; gap: 6px; }
+    .val-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      transition: border-color .15s;
+    }
+    .val-item:hover { border-color: var(--accent); }
+    .val-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .val-dot.err   { background: var(--red); }
+    .val-dot.warn  { background: var(--yellow); }
+    .val-dot.ok    { background: var(--green); }
+    .val-name { flex: 1; font-size: 12px; }
+    .val-count {
+      font-size: 11px;
+      font-weight: 700;
+      background: var(--surface2);
+      border-radius: 10px;
+      padding: 2px 8px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .val-count.has-err { background: var(--red-dim); color: var(--red); }
+
+    /* ── TICKET PANEL ── */
+    .field-group { display: flex; flex-direction: column; gap: 4px; }
+    .field-label { font-size: 11px; color: var(--muted); font-weight: 500; }
+    .field-select, .field-input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 7px 10px;
+      width: 100%;
+      outline: none;
+      transition: border-color .15s;
+    }
+    .field-select:focus, .field-input:focus { border-color: var(--accent); }
+    .field-select option { background: var(--surface2); }
+
+    .selected-info {
+      background: var(--accent-dim);
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      text-align: center;
+    }
+    .selected-count { font-size: 20px; font-weight: 700; color: var(--accent); }
+    .selected-label { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    /* ── SYNC PANEL ── */
+    .location-list { display: flex; flex-direction: column; gap: 6px; }
+    .location-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+    }
+    .loc-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .loc-name { font-size: 12px; font-weight: 600; }
+    .loc-status {
+      margin-left: auto;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .loc-status.done { background: #14281e; color: var(--green); }
+    .loc-status.running { background: #2a2010; color: var(--yellow); }
+    .loc-status.idle { background: var(--surface2); color: var(--muted); }
+    .progress-track {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--green);
+      border-radius: 2px;
+      transition: width .4s ease;
+    }
+    .loc-count { font-size: 10px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+
+    /* ── SETTINGS PANEL ── */
+    .settings-section { display: flex; flex-direction: column; gap: 8px; }
+    .setting-row { display: flex; flex-direction: column; gap: 4px; }
+    .info-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .info-box strong { color: var(--text); }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 7px;
+      border-radius: 10px;
+      font-family: var(--mono);
+    }
+    .tag-jira { background: var(--tag-jira); color: #60a5fa; }
+    .tag-local { background: var(--tag-local); color: var(--green); }
+
+    /* ── DIVIDER ── */
+    .divider { height: 1px; background: var(--border); }
+
+    /* ── TOAST ── */
+    .toast-container {
+      position: fixed; bottom: 14px; left: 14px; right: 14px;
+      z-index: 999; display: flex; flex-direction: column; gap: 6px;
+    }
+    .toast {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 9px 12px;
+      font-size: 12px;
+      display: flex; align-items: center; gap: 8px;
+      animation: slideUp .25s ease;
+    }
+    .toast.success { border-color: var(--green); }
+    .toast.error   { border-color: var(--red); }
+    .toast.warning { border-color: var(--yellow); }
+    @keyframes slideUp { from { opacity:0; transform:translateY(8px) } to { opacity:1; transform:translateY(0) } }
+
+    /* ── SCROLLBAR ── */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* ── SPINNER ── */
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .empty-state {
+      text-align: center;
+      padding: 24px 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .empty-state .icon { font-size: 28px; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div class="logo">J</div>
+    <span class="header-title">Asset Manager</span>
+    <span class="header-ws" id="ws-label">PROD</span>
+  </div>
+  <div class="tabs">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="validation">Validate</button>
+    <button class="tab" data-tab="ticket">Ticket</button>
+    <button class="tab" data-tab="sync">Sync</button>
+    <button class="tab" data-tab="settings">⚙</button>
+  </div>
+</div>
+
+<div class="panels">
+
+  <!-- ── TAB 1: DASHBOARD ── -->
+  <div class="panel active" id="panel-dashboard">
+
+    <div class="sync-bar">
+      <span class="sync-dot" id="sync-dot"></span>
+      <span id="sync-status-text">Synced</span>
+      <span class="sync-time" id="last-sync-time">—</span>
+    </div>
+
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-label">Total Assets</div>
+        <div class="stat-value ok" id="stat-total">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Pending</div>
+        <div class="stat-value warn" id="stat-pending">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Mismatch</div>
+        <div class="stat-value err" id="stat-mismatch">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Local Only</div>
+        <div class="stat-value" id="stat-local">—</div>
+      </div>
+    </div>
+
+    <div class="section-head">Actions</div>
+
+    <div class="btn-group">
+      <button class="btn btn-primary btn-block" id="btn-sync-now">⟳ Sync Now</button>
+      <button class="btn btn-outline btn-block" id="btn-open-jira">↗ Open Jira</button>
+    </div>
+    <button class="btn btn-outline btn-block" id="btn-validate-all">✓ Validate All</button>
+    <button class="btn btn-outline btn-block" id="btn-create-sheets">+ Create Location Sheets</button>
+
+    <div class="section-head">Locations</div>
+    <div id="location-summary" class="location-list">
+      <div class="empty-state"><div class="icon">🗂</div>Sync to load locations</div>
+    </div>
+  </div>
+
+  <!-- ── TAB 2: VALIDATION ── -->
+  <div class="panel" id="panel-validation">
+    <div class="section-head">Validation Results</div>
+    <div class="val-list" id="val-list">
+      <div class="empty-state"><div class="icon">✓</div>Run Validate to see results</div>
+    </div>
+    <button class="btn btn-primary btn-block" id="btn-run-validate">Run Validation</button>
+  </div>
+
+  <!-- ── TAB 3: TICKET ── -->
+  <div class="panel" id="panel-ticket">
+    <div class="selected-info">
+      <div class="selected-count" id="selected-count">0</div>
+      <div class="selected-label">rows selected with Action = "Create Ticket"</div>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Issue Type</label>
+      <select class="field-select" id="issue-type">
+        <option value="Replacement">Replacement</option>
+        <option value="Repair">Repair</option>
+        <option value="New Request">New Request</option>
+        <option value="Return">Return</option>
+        <option value="Audit">Audit</option>
+      </select>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Priority</label>
+      <select class="field-select" id="issue-priority">
+        <option value="Medium">Medium</option>
+        <option value="High">High</option>
+        <option value="Low">Low</option>
+        <option value="Critical">Critical</option>
+      </select>
+    </div>
+
+    <div class="field-group">
+      <label class="field-label">Default Days (if empty)</label>
+      <input class="field-input" type="number" id="default-days" value="30" min="1" max="365"/>
+    </div>
+
+    <div class="divider"></div>
+    <button class="btn btn-primary btn-block" id="btn-create-tickets">Create Tickets</button>
+    <button class="btn btn-outline btn-block btn-sm" id="btn-scan-pending">↻ Scan Pending Rows</button>
+
+    <div class="info-box">
+      Only rows where <strong>Action = "Create Ticket"</strong> and <strong>Case Jira is empty</strong> will be processed. This prevents duplicate tickets.
+    </div>
+  </div>
+
+  <!-- ── TAB 4: SYNC ── -->
+  <div class="panel" id="panel-sync">
+    <div class="section-head">Sync Progress</div>
+    <div id="sync-location-list" class="location-list">
+      <div class="empty-state"><div class="icon">⟳</div>No sync in progress</div>
+    </div>
+    <button class="btn btn-primary btn-block" id="btn-full-sync">Start Full Sync</button>
+    <button class="btn btn-outline btn-block btn-sm" id="btn-sync-local">↻ Re-match LOCAL Assets</button>
+
+    <div class="info-box">
+      <strong>Sync rules:</strong> Never deletes rows. Assets from Jira are marked <span class="tag tag-jira">JIRA</span>. Manually added assets are <span class="tag tag-local">LOCAL</span>. If a LOCAL asset appears in Jira by Serial Number, it's automatically matched.
+    </div>
+  </div>
+
+  <!-- ── TAB 5: SETTINGS ── -->
+  <div class="panel" id="panel-settings">
+    <div class="section-head">Jira Configuration</div>
+    <div class="settings-section">
+      <div class="setting-row">
+        <label class="field-label">Jira Base URL</label>
+        <input class="field-input" id="cfg-jira-url" type="text" placeholder="https://yourorg.atlassian.net"/>
+      </div>
+      <div class="setting-row">
+        <label class="field-label">Email</label>
+        <input class="field-input" id="cfg-email" type="text" placeholder="it@company.com"/>
+      </div>
+      <div class="setting-row">
+        <label class="field-label">API Token</label>
+        <input class="field-input" id="cfg-token" type="password" placeholder="••••••••••••••"/>
+      </div>
+      <div class="setting-row">
+        <label class="field-label">Cloud ID</label>
+        <input class="field-input" id="cfg-cloud-id" type="text" placeholder="44198ea1-5c9b-4ba5-..."/>
+        <span style="font-size:10px;color:var(--muted);margin-top:2px">Lấy từ URL API Jira Assets của bạn</span>
+      </div>
+      <div class="setting-row">
+        <label class="field-label">Workspace ID</label>
+        <input class="field-input" id="cfg-workspace-id" type="text" placeholder="ca210b15-fe15-4de0-..."/>
+        <span style="font-size:10px;color:var(--muted);margin-top:2px">Lấy từ URL API Jira Assets của bạn</span>
+      </div>
+      <div class="setting-row">
+        <label class="field-label">JSM Project Key</label>
+        <input class="field-input" id="cfg-project-key" type="text" placeholder="IT"/>
+      </div>
+    </div>
+
+    <div class="section-head">Power Automate</div>
+    <div class="settings-section">
+      <div class="setting-row">
+        <label class="field-label">Sync Webhook URL</label>
+        <input class="field-input" id="cfg-pa-sync" type="text" placeholder="https://prod.logic.azure.com/..."/>
+      </div>
+      <div class="setting-row">
+        <label class="field-label">Ticket Webhook URL</label>
+        <input class="field-input" id="cfg-pa-ticket" type="text" placeholder="https://prod.logic.azure.com/..."/>
+      </div>
+    </div>
+
+    <div class="btn-group">
+      <button class="btn btn-primary btn-block" id="btn-save-cfg">Save Settings</button>
+      <button class="btn btn-outline btn-sm" id="btn-test-conn">Test</button>
+    </div>
+
+    <div class="info-box" id="conn-test-result" style="display:none"></div>
+  </div>
+</div>
+
+<div class="toast-container" id="toast-container"></div>
+
+<script src="taskpane.js"></script>
+</body>
+</html>
