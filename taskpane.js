@@ -40,8 +40,6 @@ const CFG_KEYS = {
   CLOUD_ID:     "cloudId",
   WORKSPACE_ID: "workspaceId",
   PROJECT_KEY:  "projectKey",
-  PA_SYNC:      "paSyncUrl",
-  PA_TICKET:    "paTicketUrl",
   LAST_SYNC:    "lastSync",
 };
 
@@ -72,8 +70,6 @@ function loadConfig() {
     cloudId:     s.get(CFG_KEYS.CLOUD_ID)      || "",
     workspaceId: s.get(CFG_KEYS.WORKSPACE_ID)  || "",
     projectKey:  s.get(CFG_KEYS.PROJECT_KEY)   || "IT",
-    paSyncUrl:   s.get(CFG_KEYS.PA_SYNC)       || "",
-    paTicketUrl: s.get(CFG_KEYS.PA_TICKET)     || "",
     lastSync:    s.get(CFG_KEYS.LAST_SYNC)     || null,
   };
   updateWorkspaceLabel();
@@ -98,17 +94,12 @@ function saveConfig() {
   cfg.cloudId     = getVal("cfg-cloud-id");
   cfg.workspaceId = getVal("cfg-workspace-id");
   cfg.projectKey  = getVal("cfg-project-key");
-  cfg.paSyncUrl   = getVal("cfg-pa-sync");
-  cfg.paTicketUrl = getVal("cfg-pa-ticket");
-
   s.set(CFG_KEYS.JIRA_URL,     cfg.jiraUrl);
   s.set(CFG_KEYS.EMAIL,        cfg.email);
   s.set(CFG_KEYS.TOKEN,        cfg.token);
   s.set(CFG_KEYS.CLOUD_ID,     cfg.cloudId);
   s.set(CFG_KEYS.WORKSPACE_ID, cfg.workspaceId);
   s.set(CFG_KEYS.PROJECT_KEY,  cfg.projectKey);
-  s.set(CFG_KEYS.PA_SYNC,      cfg.paSyncUrl);
-  s.set(CFG_KEYS.PA_TICKET,    cfg.paTicketUrl);
   s.saveAsync(() => {
     updateWorkspaceLabel();
     toast("Settings saved", "success");
@@ -122,8 +113,7 @@ function populateConfigUI() {
   setVal("cfg-cloud-id",      cfg.cloudId);
   setVal("cfg-workspace-id",  cfg.workspaceId);
   setVal("cfg-project-key",   cfg.projectKey);
-  setVal("cfg-pa-sync",       cfg.paSyncUrl);
-  setVal("cfg-pa-ticket",     cfg.paTicketUrl);
+
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -438,12 +428,6 @@ async function runSync() {
 
   isSyncing = true;
   setSyncIndicator("syncing", "Syncing...");
-
-  if (cfg.paSyncUrl) {
-    triggerPowerAutomate(cfg.paSyncUrl, {
-      action: "sync", timestamp: new Date().toISOString()
-    }).catch(e => console.warn("PA trigger:", e.message));
-  }
 
   const syncPanel = document.getElementById("sync-location-list");
 
@@ -809,24 +793,9 @@ async function createTickets() {
           try {
             let ticketKey = "";
 
-            if (cfg.paTicketUrl) {
-              // Via Power Automate
-              const res = await triggerPowerAutomate(cfg.paTicketUrl, {
-                action:      "createTicket",
-                jiraPayload: ticketBody,
-                asset: {
-                  id: row[COL.ASSET_ID], key: row[COL.ASSET_KEY],
-                  deviceName, serial, email, note,
-                  days: rowDays, location: row[COL.LOCATION],
-                  issueType, priority,
-                },
-              });
-              ticketKey = res?.ticketKey || res?.key || "";
-            } else {
-              // Direct Jira API
-              const res = await jiraPost("/api/3/issue", ticketBody);
-              ticketKey = res.key || "";
-            }
+            // Direct Jira API
+            const res = await jiraPost("/api/3/issue", ticketBody);
+            ticketKey = res.key || "";
 
             if (ticketKey) {
               const ticketUrl  = `${jiraBase()}/browse/${ticketKey}`;
@@ -853,19 +822,6 @@ async function createTickets() {
   } catch(e) {
     toast("Ticket error: " + e.message, "error");
   }
-}
-
-// ══════════════════════════════════════════════════════════════
-// POWER AUTOMATE
-// ══════════════════════════════════════════════════════════════
-async function triggerPowerAutomate(url, payload) {
-  const res = await fetch(url, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(`Power Automate returned ${res.status}`);
-  try { return await res.json(); } catch { return {}; }
 }
 
 // ══════════════════════════════════════════════════════════════
