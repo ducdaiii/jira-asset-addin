@@ -40,6 +40,7 @@ const CFG_KEYS = {
   CLOUD_ID:     "cloudId",
   WORKSPACE_ID: "workspaceId",
   PROJECT_KEY:  "projectKey",
+  WORKER_URL:   "workerUrl",
   LAST_SYNC:    "lastSync",
 };
 
@@ -70,6 +71,7 @@ function loadConfig() {
     cloudId:     s.get(CFG_KEYS.CLOUD_ID)      || "",
     workspaceId: s.get(CFG_KEYS.WORKSPACE_ID)  || "",
     projectKey:  s.get(CFG_KEYS.PROJECT_KEY)   || "IT",
+    workerUrl:   s.get(CFG_KEYS.WORKER_URL)    || "",
     lastSync:    s.get(CFG_KEYS.LAST_SYNC)     || null,
   };
   updateWorkspaceLabel();
@@ -94,12 +96,14 @@ function saveConfig() {
   cfg.cloudId     = getVal("cfg-cloud-id");
   cfg.workspaceId = getVal("cfg-workspace-id");
   cfg.projectKey  = getVal("cfg-project-key");
+  cfg.workerUrl   = getVal("cfg-worker-url");
   s.set(CFG_KEYS.JIRA_URL,     cfg.jiraUrl);
   s.set(CFG_KEYS.EMAIL,        cfg.email);
   s.set(CFG_KEYS.TOKEN,        cfg.token);
   s.set(CFG_KEYS.CLOUD_ID,     cfg.cloudId);
   s.set(CFG_KEYS.WORKSPACE_ID, cfg.workspaceId);
   s.set(CFG_KEYS.PROJECT_KEY,  cfg.projectKey);
+  s.set(CFG_KEYS.WORKER_URL,   cfg.workerUrl);
   s.saveAsync(() => {
     updateWorkspaceLabel();
     toast("Settings saved", "success");
@@ -113,6 +117,7 @@ function populateConfigUI() {
   setVal("cfg-cloud-id",      cfg.cloudId);
   setVal("cfg-workspace-id",  cfg.workspaceId);
   setVal("cfg-project-key",   cfg.projectKey);
+  setVal("cfg-worker-url",    cfg.workerUrl);
 
 }
 
@@ -158,17 +163,24 @@ function switchTab(tab) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// JIRA API  — Atlassian Cloud (api.atlassian.com)
+// JIRA API — gọi qua Cloudflare Worker proxy (giải quyết CORS)
+//
+// Mọi request đều đi qua:
+//   https://YOUR_WORKER.workers.dev/proxy?url=TARGET_URL
+// Worker forward lên Jira và trả về với CORS header đúng.
 // ══════════════════════════════════════════════════════════════
 
-// https://yourorg.atlassian.net  (for /rest/api/3 calls)
 function jiraBase() {
   return cfg.jiraUrl.replace(/\/+$/, "");
 }
 
-// https://api.atlassian.com/ex/jira/{cloudId}/jsm/assets/workspace/{workspaceId}/v1
 function assetsBase() {
   return `https://api.atlassian.com/ex/jira/${cfg.cloudId}/jsm/assets/workspace/${cfg.workspaceId}/v1`;
+}
+
+function proxyUrl(targetUrl) {
+  const worker = cfg.workerUrl.replace(/\/+$/, "");
+  return `${worker}/proxy?url=${encodeURIComponent(targetUrl)}`;
 }
 
 function jiraHeaders() {
@@ -179,10 +191,10 @@ function jiraHeaders() {
   };
 }
 
-// Jira REST API (e.g. /api/3/myself, /api/3/issue)
+// Gọi Jira REST API qua proxy
 async function jiraGet(path) {
-  const url = `${jiraBase()}/rest${path}`;
-  const res = await fetch(url, { headers: jiraHeaders() });
+  const target = `${jiraBase()}/rest${path}`;
+  const res = await fetch(proxyUrl(target), { headers: jiraHeaders() });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new Error(`Jira ${res.status}${txt ? ": " + txt.slice(0, 120) : ""}`);
@@ -191,11 +203,11 @@ async function jiraGet(path) {
 }
 
 async function jiraPost(path, body) {
-  const url = `${jiraBase()}/rest${path}`;
-  const res = await fetch(url, {
-    method: "POST",
+  const target = `${jiraBase()}/rest${path}`;
+  const res = await fetch(proxyUrl(target), {
+    method:  "POST",
     headers: jiraHeaders(),
-    body: JSON.stringify(body),
+    body:    JSON.stringify(body),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -204,23 +216,13 @@ async function jiraPost(path, body) {
   return res.json();
 }
 
-// Jira Assets API (api.atlassian.com)
-async function assetsGet(path) {
-  const url = `${assetsBase()}${path}`;
-  const res = await fetch(url, { headers: jiraHeaders() });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Assets API ${res.status}${txt ? ": " + txt.slice(0, 120) : ""}`);
-  }
-  return res.json();
-}
-
+// Gọi Jira Assets API qua proxy
 async function assetsPost(path, body) {
-  const url = `${assetsBase()}${path}`;
-  const res = await fetch(url, {
-    method: "POST",
+  const target = `${assetsBase()}${path}`;
+  const res = await fetch(proxyUrl(target), {
+    method:  "POST",
     headers: jiraHeaders(),
-    body: JSON.stringify(body),
+    body:    JSON.stringify(body),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -836,6 +838,14 @@ async function testConnection() {
   </div>`;
 
   saveConfig(); // persist + reload cfg first
+
+  if (!cfg.workerUrl) {
+    el.innerHTML = "✗ Worker URL chưa được điền";
+    el.style.display = "block";
+    el.style.borderColor = "var(--red)";
+    toast("Điền Cloudflare Worker URL trước", "error");
+    return;
+  }
 
   try {
     // 1. Test Jira REST API
