@@ -305,49 +305,27 @@ function parseAsset(obj) {
 }
 
 // ── Fetch tất cả assets của 1 AQL query ───────────────────────
-// Logic pagination theo field "total" từ API:
-//   - total < 1000 → chạy đủ 1 batch (startAt..startAt+total), dừng
-//   - total = 1000 → có thể còn data → chạy tiếp batch kế (startAt += 1000)
-//   - total = 0    → hết data → dừng
+// Dùng field "isLast" từ API để biết trang cuối.
+// Nếu API không trả isLast thì fallback: values.length < pageSize = trang cuối.
 async function fetchByQuery(qlQuery) {
-  const assets = [];
-  const batchSize = 1000; // mỗi batch tối đa 1000
-  const pageSize  = 25;   // mỗi page 25 record
-  let batchStart  = 0;    // startAt của batch hiện tại
+  const assets  = [];
+  const pageSize = 25;
+  let startAt    = 0;
 
   while (true) {
-    // Fetch từng page trong batch
-    let pageStart = batchStart;
-    let batchTotal = null;
+    const data   = await fetchPage(qlQuery, startAt, pageSize);
+    const values = data.values || [];
 
-    while (true) {
-      const data   = await fetchPage(qlQuery, pageStart, pageSize);
-      const values = data.values || [];
-      const total  = typeof data.total === "number" ? data.total : 0;
+    if (values.length === 0) break;
+    values.forEach(obj => assets.push(parseAsset(obj)));
+    startAt += values.length;
 
-      // Lấy total của batch từ page đầu tiên
-      if (batchTotal === null) batchTotal = total;
+    const isLast = data.isLast === true || data.last === true;
+    console.log(`  [${qlQuery}] loaded=${assets.length}, isLast=${isLast}, got=${values.length}`);
 
-      if (values.length === 0) break;
-      values.forEach(obj => assets.push(parseAsset(obj)));
-      pageStart += values.length;
-
-      console.log(`  [${qlQuery}] loaded ${assets.length}, page startAt=${pageStart}, batchTotal=${batchTotal}`);
-
-      // Hết batch này (đã load đủ total records của batch)
-      if (pageStart >= batchStart + (batchTotal || 0)) break;
-      if (values.length < pageSize) break;
-    }
-
-    // Quyết định có chạy batch tiếp không
-    if (batchTotal === null || batchTotal < batchSize) {
-      // total < 1000 → đã lấy hết, dừng
-      break;
-    }
-
-    // total = 1000 → chạy batch tiếp
-    batchStart += batchSize;
-    console.log(`  [${qlQuery}] total=${batchTotal} = 1000, loading next batch from ${batchStart}...`);
+    // Dừng khi API báo isLast hoặc page không đầy
+    if (isLast) break;
+    if (values.length < pageSize) break;
   }
 
   console.log(`  [${qlQuery}] done: ${assets.length} assets`);
