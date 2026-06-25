@@ -304,79 +304,63 @@ function parseAsset(obj) {
   };
 }
 
-// ── Fetch tất cả assets của 1 AQL query (tối đa 1000/query) ───
+// ── Fetch tất cả assets của 1 AQL query ───────────────────────
+// API không luôn trả total → dùng "page không đầy = trang cuối"
 async function fetchByQuery(qlQuery) {
   const assets = [];
   let startAt = 0;
   const pageSize = 25;
-  let total = null;
 
   while (true) {
     const data = await fetchPage(qlQuery, startAt, pageSize);
     const values = data.values || [];
 
-    if (total === null) {
-      total = typeof data.total === "number"        ? data.total
-            : typeof data.totalObjects === "number" ? data.totalObjects
-            : null;
-    }
-
-    if (values.length === 0) break;
+    if (values.length === 0) break;                 // trang rỗng → dừng
     values.forEach(obj => assets.push(parseAsset(obj)));
-
     startAt += values.length;
-    console.log(`  [${qlQuery.slice(0,40)}] startAt=${startAt}/${total ?? "?"}`);
-
-    if (total !== null && startAt >= total) break;
-    if (values.length < pageSize) break;
+    console.log(`  [typeId query] loaded ${startAt} so far...`);
+    if (values.length < pageSize) break;            // trang không đầy = trang cuối
   }
-  return { assets, total };
+  return assets;
 }
 
-// ── Fetch ALL assets — chia nhỏ theo từng objectTypeId ─────────
-// Jira Assets API hard limit: 1000 records per query
-// Giải pháp: tách AQL "objectTypeId IN (A,B,C)" thành query riêng
-// từng typeId → mỗi query tối đa 1000, gộp lại không giới hạn
+// ── Parse objectTypeIds từ AQL config ────────────────────────
+function parseTypeIds() {
+  const aqlRaw = (cfg.aqlQuery || "").trim();
+  const m = aqlRaw.match(/objectTypeId\s+IN\s*\(([^)]+)\)/i);
+  if (m) return m[1].split(",").map(s => s.trim()).filter(Boolean);
+  const m2 = aqlRaw.match(/objectTypeId\s*=\s*(\d+)/i);
+  if (m2) return [m2[1]];
+  return [];
+}
+
+// ── Fetch ALL assets, từng typeId riêng để bypass 1000 limit ──
 async function fetchJiraAssets() {
-  const aqlRaw = (cfg.aqlQuery || "objectTypeId IN (525,527,529)").trim();
-
-  // Parse objectTypeId list từ AQL config
-  const typeIdMatch = aqlRaw.match(/objectTypeId\s+IN\s*\(([^)]+)\)/i);
-  let typeIds = [];
-  if (typeIdMatch) {
-    typeIds = typeIdMatch[1].split(",").map(s => s.trim()).filter(Boolean);
+  const typeIds = parseTypeIds();
+  if (!typeIds.length) {
+    toast("AQL Query chưa được cấu hình đúng", "error");
+    return [];
   }
 
-  let allAssets = [];
+  const seenIds = new Set();
+  const allAssets = [];
 
-  if (typeIds.length <= 1) {
-    // Query đơn — fetch bình thường
-    const { assets, total } = await fetchByQuery(aqlRaw);
-    allAssets = assets;
-    console.log(`fetchJiraAssets: single query, loaded ${allAssets.length} (total=${total})`);
-  } else {
-    // Chia thành từng query riêng theo typeId
-    console.log(`fetchJiraAssets: splitting into ${typeIds.length} queries to bypass 1000 limit`);
-    const seenIds = new Set(); // chống trùng nếu asset thuộc nhiều type
-
-    for (const typeId of typeIds) {
-      const singleQuery = `objectTypeId = ${typeId}`;
-      toast(`Đang tải objectTypeId=${typeId}...`, "warning");
-      const { assets, total } = await fetchByQuery(singleQuery);
-
-      let added = 0;
-      assets.forEach(a => {
-        if (!seenIds.has(a.id)) {
-          seenIds.add(a.id);
-          allAssets.push(a);
-          added++;
-        }
-      });
-      console.log(`  typeId=${typeId}: got ${assets.length} (total=${total}), added=${added}`);
-    }
-    console.log(`fetchJiraAssets: total loaded ${allAssets.length} across ${typeIds.length} types`);
+  for (let i = 0; i < typeIds.length; i++) {
+    const typeId = typeIds[i];
+    toast(`Đang tải objectTypeId=${typeId} (${i+1}/${typeIds.length})...`, "warning");
+    const assets = await fetchByQuery(`objectTypeId = ${typeId}`);
+    let added = 0;
+    assets.forEach(a => {
+      if (!seenIds.has(a.id)) {
+        seenIds.add(a.id);
+        allAssets.push(a);
+        added++;
+      }
+    });
+    console.log(`typeId=${typeId}: fetched=${assets.length}, added=${added}, total=${allAssets.length}`);
   }
 
+  console.log(`fetchJiraAssets complete: ${allAssets.length} assets from ${typeIds.length} typeId(s)`);
   return allAssets;
 }
 
@@ -535,7 +519,15 @@ async function createLocationSheets() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// SYNC — batch write, chỉ 1 context.sync() mỗi sheet
+// SYNC ENGINE
+// Luồng:
+//   1. Fetch từng objectTypeId riêng (bypass 1000 limit)
+//   2. Group tất cả assets theo Location
+//   3. Mỗi location: tạo sheet nếu chưa có
+//      - Asset đã có trong sheet → UPDATE tại chỗ
+//      - Asset mới                → INSERT cuối sheet
+//      - Asset trong sheet ko còn trong Jira → "Not in Jira"
+//   4. LOCAL rows → push lên Jira Assets API
 // ══════════════════════════════════════════════════════════════
 function assetToRow(asset, loc, now, existingRow) {
   // existingRow: dòng hiện có (để preserve DAYS, NOTE, ACTION, CASE_JIRA)
@@ -571,163 +563,223 @@ function assetToRow(asset, loc, now, existingRow) {
   return row;
 }
 
+// ── Write 1 location sheet (dùng chung cho mọi typeId) ────────
+async function writeLocationSheet(sheetName, assets, now) {
+  await Excel.run(async (context) => {
+    const sheet = await ensureSheet(context, sheetName);
+    await ensureHeaders(context, sheet);
+
+    const existing = await readSheetRows(context, sheet);
+    const byId = {}, bySerial = {};
+    existing.forEach((row, idx) => {
+      const id  = String(row[COL.ASSET_ID] || "").trim();
+      const ser = String(row[COL.SERIAL]   || "").trim();
+      if (id)  byId[id]      = idx;
+      if (ser) bySerial[ser] = idx;
+    });
+
+    const jiraIdSet   = new Set(assets.map(a => a.id).filter(Boolean));
+    const updatedIdxs = new Set();
+
+    // A: UPDATE existing rows
+    assets.forEach(asset => {
+      const idx =
+        byId[asset.id] !== undefined                         ? byId[asset.id] :
+        asset.serial && bySerial[asset.serial] !== undefined ? bySerial[asset.serial] :
+        -1;
+      if (idx >= 0) {
+        const newRow = assetToRow(asset, asset.location || "", now, existing[idx]);
+        if (newRow[COL.VALIDATION] === "Not in Jira") newRow[COL.VALIDATION] = "";
+        sheet.getRangeByIndexes(idx + 1, 0, 1, COL_COUNT).values = [newRow];
+        updatedIdxs.add(idx);
+      }
+    });
+
+    // B: Mark rows không còn trong Jira
+    existing.forEach((row, idx) => {
+      if (updatedIdxs.has(idx))             return;
+      if (row[COL.SYNC_STATUS] === "LOCAL") return;
+      const id = String(row[COL.ASSET_ID] || "").trim();
+      if (!id || jiraIdSet.has(id))         return;
+      const cell = sheet.getRangeByIndexes(idx + 1, COL.VALIDATION, 1, 1);
+      cell.values = [["Not in Jira"]];
+      cell.format.font.color = "#f59e0b";
+    });
+
+    // C: INSERT rows mới
+    const toInsert = assets.filter(a =>
+      byId[a.id] === undefined &&
+      !(a.serial && bySerial[a.serial] !== undefined)
+    );
+    if (toInsert.length > 0) {
+      const used = sheet.getUsedRangeOrNullObject(true);
+      await context.sync();
+      let startRow = 1;
+      if (!used.isNullObject) {
+        used.load("rowCount");
+        await context.sync();
+        startRow = used.rowCount;
+      }
+      sheet.getRangeByIndexes(startRow, 0, toInsert.length, COL_COUNT).values =
+        toInsert.map(a => assetToRow(a, a.location || "", now, null));
+    }
+
+    await context.sync();
+    console.log(`${sheetName}: updated=${updatedIdxs.size}, inserted=${toInsert.length}`);
+  });
+}
+
 async function runSync() {
   if (isSyncing) { toast("Sync already running", "warning"); return; }
-  if (!cfg.jiraUrl || !cfg.token) {
-    toast("Configure Jira settings first", "warning"); return;
+  if (!cfg.jiraUrl || !cfg.token || !cfg.workerUrl) {
+    toast("Kiểm tra lại Settings (URL, token, worker)", "warning"); return;
   }
 
   isSyncing = true;
   setSyncIndicator("syncing", "Syncing...");
   const syncPanel = document.getElementById("sync-location-list");
+  syncPanel.innerHTML = `<div class="empty-state"><div class="spinner"></div>Đang tải từ Jira...</div>`;
 
   try {
-    // ── BƯỚC 1: Fetch toàn bộ assets từ Jira (ngoài Excel.run) ──
-    toast("Đang tải assets từ Jira...", "warning");
-    const jiraAssets = await fetchJiraAssets();
-    toast(`Đã tải ${jiraAssets.length} assets, đang ghi vào Excel...`, "warning");
-
-    // Group by location
-    const byLocation = {};
-    jiraAssets.forEach(a => {
-      const loc = (a.location || "UNKNOWN").trim();
-      if (!byLocation[loc]) byLocation[loc] = [];
-      byLocation[loc].push(a);
-    });
-
-    const locations = Object.keys(byLocation);
-    let syncState = locations.map(l => ({
-      name: l, done: 0, total: byLocation[l].length, status: "idle"
-    }));
-    updateSyncPanel(syncPanel, syncState);
-
-    // ── BƯỚC 2: Ghi vào Excel — mỗi sheet 1 Excel.run() riêng ──
-    // Tách ra từng Excel.run() để tránh timeout với dataset lớn
-    for (let li = 0; li < locations.length; li++) {
-      const loc       = locations[li];
-      const assets    = byLocation[loc];
-      const sheetName = locationSheetName(loc);
-      const now       = new Date().toISOString();
-
-      syncState[li].status = "running";
-      updateSyncPanel(syncPanel, syncState);
-
-      await Excel.run(async (context) => {
-        const sheet = await ensureSheet(context, sheetName);
-        await ensureHeaders(context, sheet);
-
-        // ── Đọc toàn bộ sheet 1 lần ──
-        const existing = await readSheetRows(context, sheet);
-
-        // Build lookup maps
-        const byId     = {};
-        const bySerial = {};
-        existing.forEach((row, idx) => {
-          const id  = String(row[COL.ASSET_ID] || "").trim();
-          const ser = String(row[COL.SERIAL]   || "").trim();
-          if (id)  byId[id]     = idx;
-          if (ser) bySerial[ser] = idx;
-        });
-
-
-
-        // ══════════════════════════════════════════════
-        // SYNC STRATEGY:
-        //   JIRA asset có trong sheet  → UPDATE tại chỗ
-        //   JIRA asset chưa có         → INSERT dòng mới cuối sheet
-        //   Sheet row không còn Jira   → GIỮ NGUYÊN, Validation = "Not in Jira"
-        // ══════════════════════════════════════════════
-
-        // Build set Asset ID nào Jira đang có (cho sheet này)
-        const jiraIdSet = new Set(assets.map(a => a.id).filter(Boolean));
-
-        // ── Bước A: UPDATE các dòng đã có trong sheet ──
-        const updatedIdxs = new Set();
-        assets.forEach(asset => {
-          const existingIdx =
-            byId[asset.id] !== undefined                         ? byId[asset.id] :
-            asset.serial && bySerial[asset.serial] !== undefined ? bySerial[asset.serial] :
-            -1;
-
-          if (existingIdx >= 0) {
-            const newRow = assetToRow(asset, loc, now, existing[existingIdx]);
-            // Clear "Not in Jira" nếu asset quay lại
-            if (newRow[COL.VALIDATION] === "Not in Jira") newRow[COL.VALIDATION] = "";
-            const range = sheet.getRangeByIndexes(existingIdx + 1, 0, 1, COL_COUNT);
-            range.values = [newRow];
-            updatedIdxs.add(existingIdx);
-          }
-        });
-
-        // ── Bước B: Mark rows không còn trong Jira → Validation = "Not in Jira" ──
-        existing.forEach((row, idx) => {
-          if (updatedIdxs.has(idx)) return;                    // đã update
-          if (row[COL.SYNC_STATUS] === "LOCAL") return;        // LOCAL row — bỏ qua
-          const assetId = String(row[COL.ASSET_ID] || "").trim();
-          if (!assetId) return;                                // không có ID — bỏ qua
-          if (!jiraIdSet.has(assetId)) {
-            // Asset này không còn trong Jira response
-            const valCell = sheet.getRangeByIndexes(idx + 1, COL.VALIDATION, 1, 1);
-            valCell.values = [["Not in Jira"]];
-            valCell.format.font.color = "#f59e0b"; // màu vàng cảnh báo
-          }
-        });
-
-        // ── Bước C: INSERT các asset mới chưa có trong sheet ──
-        const toInsert = assets.filter(asset => {
-          const byIdMatch     = byId[asset.id] !== undefined;
-          const bySerialMatch = asset.serial && bySerial[asset.serial] !== undefined;
-          return !byIdMatch && !bySerialMatch;
-        });
-
-        if (toInsert.length > 0) {
-          const used = sheet.getUsedRangeOrNullObject(true);
-          await context.sync(); // cần biết rowCount hiện tại
-          let startRow = 1;
-          if (!used.isNullObject) {
-            used.load("rowCount");
-            await context.sync();
-            startRow = used.rowCount;
-          }
-          const newRows = toInsert.map(a => assetToRow(a, loc, now, null));
-          const insertRange = sheet.getRangeByIndexes(startRow, 0, newRows.length, COL_COUNT);
-          insertRange.values = newRows;
-        }
-
-        // ── 1 context.sync() flush toàn bộ ──
-        await context.sync();
-
-        const notInJira = existing.filter((row, idx) => {
-          if (updatedIdxs.has(idx) || row[COL.SYNC_STATUS] === "LOCAL") return false;
-          const id = String(row[COL.ASSET_ID] || "").trim();
-          return id && !jiraIdSet.has(id);
-        }).length;
-
-        syncState[li].done   = assets.length;
-        syncState[li].status = "done";
-        updateSyncPanel(syncPanel, syncState);
-        console.log(`Sheet ${sheetName}: updated=${updatedIdxs.size}, inserted=${toInsert.length}, notInJira=${notInJira}`);
-      });
+    const typeIds = parseTypeIds();
+    if (!typeIds.length) {
+      toast("AQL Query chưa đúng — cần objectTypeId IN (...)", "error");
+      return;
     }
 
-    // Persist last sync time
+    // byLocation tích lũy qua từng typeId
+    // key = locationSheetName, value = Map<assetId, asset>
+    // Dùng Map để tự dedup nếu asset xuất hiện ở nhiều typeId
+    const locationMap = {}; // sheetName → Map<id, asset>
+    const seenIds     = new Set();
+    let totalFetched  = 0;
+    const now         = new Date().toISOString();
+
+    for (let i = 0; i < typeIds.length; i++) {
+      const typeId = typeIds[i];
+      toast(`[${i+1}/${typeIds.length}] Đang tải objectTypeId=${typeId}...`, "warning");
+
+      const assets = await fetchByQuery(`objectTypeId = ${typeId}`);
+      let added = 0;
+
+      assets.forEach(a => {
+        if (seenIds.has(a.id)) return;
+        seenIds.add(a.id);
+        added++;
+        totalFetched++;
+
+        const sheetName = locationSheetName((a.location || "UNKNOWN").trim());
+        if (!locationMap[sheetName]) locationMap[sheetName] = new Map();
+        locationMap[sheetName].set(a.id, a);
+      });
+
+      console.log(`typeId=${typeId}: fetched=${assets.length}, added=${added}, total=${totalFetched}`);
+
+      // Ghi ngay vào Excel sau mỗi typeId — không chờ load hết
+      const sheetNames = Object.keys(locationMap);
+      const uiState = sheetNames.map(s => ({
+        name: s.replace("LOC_", ""),
+        done: locationMap[s].size,
+        total: locationMap[s].size,
+        status: i < typeIds.length - 1 ? "running" : "done",
+      }));
+      updateSyncPanel(syncPanel, uiState);
+
+      for (const sheetName of sheetNames) {
+        const sheetAssets = Array.from(locationMap[sheetName].values());
+        await writeLocationSheet(sheetName, sheetAssets, now);
+      }
+    }
+
+    // Push LOCAL rows lên Jira
+    toast("Đang push LOCAL assets lên Jira...", "warning");
+    await pushLocalAssets();
+
     cfg.lastSync = new Date().toISOString();
     Office.context.document.settings.set(CFG_KEYS.LAST_SYNC, cfg.lastSync);
     Office.context.document.settings.saveAsync();
 
     setSyncIndicator("ok", "Synced");
     setInner("last-sync-time", formatTime(cfg.lastSync));
-    toast(`Sync hoàn tất — ${jiraAssets.length} assets, ${locations.length} location(s)`, "success");
+    toast(`Sync hoàn tất — ${totalFetched} assets, ${Object.keys(locationMap).length} location(s)`, "success");
     await refreshDashboard();
 
   } catch(e) {
     setSyncIndicator("ok", "Sync failed");
     toast("Sync error: " + e.message, "error");
-    console.error("runSync error:", e);
+    console.error("runSync:", e);
   } finally {
     isSyncing = false;
   }
 }
+
+// ── Push LOCAL rows lên Jira Assets ───────────────────────────
+async function pushLocalAssets() {
+  if (!cfg.cloudId || !cfg.workspaceId) return;
+  const typeIds       = parseTypeIds();
+  const defaultTypeId = typeIds[0] || "";
+  if (!defaultTypeId) return;
+
+  let pushed = 0, failed = 0;
+  try {
+    await Excel.run(async (context) => {
+      const sheets = await getLocationSheets(context);
+      for (const sheetName of sheets) {
+        const sheet = context.workbook.worksheets.getItem(sheetName);
+        const rows  = await readSheetRows(context, sheet);
+
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          if (row[COL.SYNC_STATUS] !== "LOCAL") continue;
+          if (row[COL.ASSET_ID])               continue; // đã có ID = đã push
+
+          const hostname = String(row[COL.HOSTNAME] || "").trim();
+          const serial   = String(row[COL.SERIAL]   || "").trim();
+          if (!hostname && !serial) continue;
+
+          try {
+            const attrs = [
+              { objectTypeAttributeId: 1737,  objectAttributeValues: [{ value: hostname }] },
+              { objectTypeAttributeId: 5194,  objectAttributeValues: [{ value: serial }] },
+              { objectTypeAttributeId: 30125, objectAttributeValues: [{ value: row[COL.LOCATION] || "" }] },
+              { objectTypeAttributeId: 5200,  objectAttributeValues: [{ value: row[COL.USERNAME] || "" }] },
+            ].filter(a => a.objectAttributeValues[0].value);
+
+            const res = await assetsPost("/object/create", {
+              objectTypeId: defaultTypeId,
+              attributes:   attrs,
+            });
+
+            if (res?.id) {
+              const range = sheet.getRangeByIndexes(i + 1, 0, 1, COL_COUNT);
+              range.load("values");
+              await context.sync();
+              const cur = range.values[0];
+              cur[COL.ASSET_ID]    = String(res.id);
+              cur[COL.ASSET_KEY]   = res.objectKey || "";
+              cur[COL.SYNC_STATUS] = "JIRA";
+              cur[COL.VALIDATION]  = "OK";
+              cur[COL.LAST_SYNC]   = new Date().toISOString();
+              range.values = [cur];
+              await context.sync();
+              pushed++;
+            }
+          } catch(e) {
+            failed++;
+            console.warn(`pushLocal row ${i+2} in ${sheetName}:`, e.message);
+          }
+        }
+      }
+    });
+    if (pushed > 0 || failed > 0) {
+      toast(`LOCAL push: ${pushed} thành công${failed ? ", " + failed + " lỗi" : ""}`,
+        failed ? "warning" : "success");
+    }
+  } catch(e) {
+    console.warn("pushLocalAssets:", e.message);
+  }
+}
+
 
 function updateSyncPanel(el, state) {
   el.innerHTML = state.map(l => `
