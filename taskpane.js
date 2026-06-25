@@ -305,30 +305,49 @@ function parseAsset(obj) {
 }
 
 // ── Fetch tất cả assets của 1 AQL query ───────────────────────
-// Dùng field "isLast" từ API để biết trang cuối.
-// Nếu API không trả isLast thì fallback: values.length < pageSize = trang cuối.
+// API giới hạn trả tối đa 1000 record/query (total <= 1000).
+// Chiến lược:
+//   - Mỗi "window": fetch từ startAt, dùng total của window làm limit
+//   - Nếu total < 1000 → đây là window cuối, dừng sau khi load hết
+//   - Nếu total = 1000 → còn data, dịch startAt += 1000 và fetch window tiếp
 async function fetchByQuery(qlQuery) {
-  const assets  = [];
-  const pageSize = 25;
-  let startAt    = 0;
+  const assets    = [];
+  const pageSize  = 25;
+  const API_LIMIT = 1000; // hard limit của Jira Assets API
+  let windowStart = 0;    // startAt của window hiện tại
 
   while (true) {
-    const data   = await fetchPage(qlQuery, startAt, pageSize);
-    const values = data.values || [];
+    // Lấy total của window này từ page đầu tiên
+    const firstPage   = await fetchPage(qlQuery, windowStart, pageSize);
+    const windowTotal = typeof firstPage.total === "number" ? firstPage.total : 0;
+    console.log(`  [${qlQuery}] window startAt=${windowStart}, total=${windowTotal}`);
 
-    if (values.length === 0) break;
-    values.forEach(obj => assets.push(parseAsset(obj)));
-    startAt += values.length;
+    if (windowTotal === 0 || firstPage.values?.length === 0) break;
 
-    const isLast = data.isLast === true || data.last === true;
-    console.log(`  [${qlQuery}] loaded=${assets.length}, isLast=${isLast}, got=${values.length}`);
+    // Load hết window này (windowStart → windowStart + windowTotal)
+    firstPage.values.forEach(obj => assets.push(parseAsset(obj)));
+    let pageStart = windowStart + firstPage.values.length;
 
-    // Dừng khi API báo isLast hoặc page không đầy
-    if (isLast) break;
-    if (values.length < pageSize) break;
+    while (assets.length < windowStart + windowTotal) {
+      const data   = await fetchPage(qlQuery, pageStart, pageSize);
+      const values = data.values || [];
+      if (values.length === 0) break;
+      values.forEach(obj => assets.push(parseAsset(obj)));
+      pageStart += values.length;
+      console.log(`  [${qlQuery}] loaded=${assets.length}/${windowStart + windowTotal}`);
+      if (values.length < pageSize) break;
+    }
+
+    console.log(`  [${qlQuery}] window done: ${assets.length} total so far`);
+
+    // Nếu window này < 1000 → đã lấy hết, dừng
+    if (windowTotal < API_LIMIT) break;
+
+    // Nếu window = 1000 → còn data, dịch sang window tiếp
+    windowStart += API_LIMIT;
   }
 
-  console.log(`  [${qlQuery}] done: ${assets.length} assets`);
+  console.log(`  [${qlQuery}] DONE: ${assets.length} assets`);
   return assets;
 }
 
@@ -381,7 +400,7 @@ function _legacyParseBlock(obj) {
 // SHEET HELPERS
 // ══════════════════════════════════════════════════════════════
 function locationSheetName(loc) {
-  return "_" + loc.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase();
+  return "LOC_" + loc.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase();
 }
 
 async function ensureSheet(context, name) {
@@ -442,7 +461,7 @@ async function getLocationSheets(context) {
   context.workbook.worksheets.load("items/name");
   await context.sync();
   return context.workbook.worksheets.items
-    .filter(s => s.name.startsWith("_"))
+    .filter(s => s.name.startsWith("LOC_"))
     .map(s => s.name);
 }
 
@@ -686,7 +705,7 @@ async function runSync() {
       // Ghi ngay vào Excel sau mỗi typeId — không chờ load hết
       const sheetNames = Object.keys(locationMap);
       const uiState = sheetNames.map(s => ({
-        name: s.replace("_", ""),
+        name: s.replace("LOC_", ""),
         done: locationMap[s].size,
         total: locationMap[s].size,
         status: i < typeIds.length - 1 ? "running" : "done",
