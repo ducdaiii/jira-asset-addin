@@ -486,8 +486,42 @@ async function createLocationSheets() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// SYNC
+// SYNC — batch write, chỉ 1 context.sync() mỗi sheet
 // ══════════════════════════════════════════════════════════════
+function assetToRow(asset, loc, now, existingRow) {
+  // existingRow: dòng hiện có (để preserve DAYS, NOTE, ACTION, CASE_JIRA)
+  const row = existingRow ? [...existingRow] : Array(COL_COUNT).fill("");
+  row[COL.ASSET_ID]     = asset.id;
+  row[COL.ASSET_KEY]    = asset.key;
+  row[COL.HOSTNAME]     = asset.hostname;
+  row[COL.SERIAL]       = asset.serial;
+  row[COL.STATUS]       = asset.status;
+  row[COL.LOCATION]     = loc;
+  row[COL.REGION]       = asset.region;
+  row[COL.MANUFACTURER] = asset.manufacturer;
+  row[COL.MODEL]        = asset.model;
+  row[COL.OS]           = asset.os;
+  row[COL.OS_VERSION]   = asset.osVersion;
+  row[COL.OS_BUILD]     = asset.osBuild;
+  row[COL.CPU]          = asset.cpu;
+  row[COL.IP]           = asset.ip;
+  row[COL.MAC]          = asset.mac;
+  row[COL.NETWORK]      = asset.network;
+  row[COL.ANTIVIRUS]    = asset.antivirus;
+  row[COL.USERNAME]     = asset.username;
+  row[COL.ASSIGNED]     = asset.assigned;
+  row[COL.FIRST_SEEN]   = asset.firstSeen;
+  row[COL.LAST_SEEN]    = asset.lastSeen;
+  row[COL.PURCHASE]     = asset.purchase;
+  row[COL.WARRANTY]     = asset.warranty;
+  row[COL.TENANT_ID]    = asset.tenantId;
+  row[COL.LANSWEEPER]   = asset.lansweeper;
+  row[COL.SYNC_STATUS]  = "JIRA";
+  row[COL.LAST_SYNC]    = now;
+  // COL.DAYS, COL.NOTE, COL.ACTION, COL.CASE_JIRA — preserved từ existingRow
+  return row;
+}
+
 async function runSync() {
   if (isSyncing) { toast("Sync already running", "warning"); return; }
   if (!cfg.jiraUrl || !cfg.token) {
@@ -496,12 +530,13 @@ async function runSync() {
 
   isSyncing = true;
   setSyncIndicator("syncing", "Syncing...");
-
   const syncPanel = document.getElementById("sync-location-list");
 
   try {
-    toast("Fetching assets from Jira...", "warning");
+    // ── BƯỚC 1: Fetch toàn bộ assets từ Jira (ngoài Excel.run) ──
+    toast("Đang tải assets từ Jira...", "warning");
     const jiraAssets = await fetchJiraAssets();
+    toast(`Đã tải ${jiraAssets.length} assets, đang ghi vào Excel...`, "warning");
 
     // Group by location
     const byLocation = {};
@@ -511,125 +546,91 @@ async function runSync() {
       byLocation[loc].push(a);
     });
 
-    const locations  = Object.keys(byLocation);
-    let syncState    = locations.map(l => ({
+    const locations = Object.keys(byLocation);
+    let syncState = locations.map(l => ({
       name: l, done: 0, total: byLocation[l].length, status: "idle"
     }));
     updateSyncPanel(syncPanel, syncState);
 
-    await Excel.run(async (context) => {
-      for (let li = 0; li < locations.length; li++) {
-        const loc       = locations[li];
-        const assets    = byLocation[loc];
-        const sheetName = locationSheetName(loc);
+    // ── BƯỚC 2: Ghi vào Excel — mỗi sheet 1 Excel.run() riêng ──
+    // Tách ra từng Excel.run() để tránh timeout với dataset lớn
+    for (let li = 0; li < locations.length; li++) {
+      const loc       = locations[li];
+      const assets    = byLocation[loc];
+      const sheetName = locationSheetName(loc);
+      const now       = new Date().toISOString();
 
-        syncState[li].status = "running";
-        updateSyncPanel(syncPanel, syncState);
+      syncState[li].status = "running";
+      updateSyncPanel(syncPanel, syncState);
 
+      await Excel.run(async (context) => {
         const sheet = await ensureSheet(context, sheetName);
         await ensureHeaders(context, sheet);
 
-        // Build lookup maps from existing rows
+        // ── Đọc toàn bộ sheet 1 lần ──
         const existing = await readSheetRows(context, sheet);
+
+        // Build lookup maps
         const byId     = {};
         const bySerial = {};
         existing.forEach((row, idx) => {
           const id  = String(row[COL.ASSET_ID] || "").trim();
           const ser = String(row[COL.SERIAL]   || "").trim();
-          if (id)  byId[id]   = idx;
+          if (id)  byId[id]     = idx;
           if (ser) bySerial[ser] = idx;
         });
 
-        const now = new Date().toISOString();
+        // ── Phân loại: UPDATE vs INSERT ──
+        const toUpdate = []; // { rowIdx, newRow }
+        const toInsert = []; // row arrays
 
-        for (const asset of assets) {
+        assets.forEach(asset => {
           const existingIdx =
-            byId[asset.id]         !== undefined ? byId[asset.id] :
-            bySerial[asset.serial] !== undefined && asset.serial ? bySerial[asset.serial] :
+            byId[asset.id] !== undefined                            ? byId[asset.id] :
+            asset.serial && bySerial[asset.serial] !== undefined   ? bySerial[asset.serial] :
             -1;
 
           if (existingIdx >= 0) {
-            // UPDATE — preserve user-entered cols (DAYS, NOTE, ACTION)
-            const updateRange = sheet.getRangeByIndexes(existingIdx + 1, 0, 1, COL_COUNT);
-            updateRange.load("values");
-            await context.sync();
-            const cur = updateRange.values[0];
-            cur[COL.ASSET_ID]    = asset.id;
-            cur[COL.ASSET_KEY]   = asset.key;
-            cur[COL.HOSTNAME]    = asset.hostname;
-            cur[COL.SERIAL]      = asset.serial;
-            cur[COL.STATUS]      = asset.status;
-            cur[COL.LOCATION]    = loc;
-            cur[COL.REGION]      = asset.region;
-            cur[COL.MANUFACTURER]= asset.manufacturer;
-            cur[COL.MODEL]       = asset.model;
-            cur[COL.OS]          = asset.os;
-            cur[COL.OS_VERSION]  = asset.osVersion;
-            cur[COL.OS_BUILD]    = asset.osBuild;
-            cur[COL.CPU]         = asset.cpu;
-            cur[COL.IP]          = asset.ip;
-            cur[COL.MAC]         = asset.mac;
-            cur[COL.NETWORK]     = asset.network;
-            cur[COL.ANTIVIRUS]   = asset.antivirus;
-            cur[COL.USERNAME]    = asset.username;
-            cur[COL.ASSIGNED]    = asset.assigned;
-            cur[COL.FIRST_SEEN]  = asset.firstSeen;
-            cur[COL.LAST_SEEN]   = asset.lastSeen;
-            cur[COL.PURCHASE]    = asset.purchase;
-            cur[COL.WARRANTY]    = asset.warranty;
-            cur[COL.TENANT_ID]   = asset.tenantId;
-            cur[COL.LANSWEEPER]  = asset.lansweeper;
-            cur[COL.SYNC_STATUS] = "JIRA";
-            cur[COL.LAST_SYNC]   = now;
-            // cur[COL.DAYS], cur[COL.NOTE], cur[COL.ACTION] — intentionally preserved
-            updateRange.values   = [cur];
-            await context.sync();
+            toUpdate.push({
+              rowIdx: existingIdx,
+              newRow: assetToRow(asset, loc, now, existing[existingIdx])
+            });
           } else {
-            // INSERT new row
-            const row             = Array(COL_COUNT).fill("");
-            row[COL.ASSET_ID]    = asset.id;
-            row[COL.ASSET_KEY]   = asset.key;
-            row[COL.HOSTNAME]    = asset.hostname;
-            row[COL.SERIAL]      = asset.serial;
-            row[COL.STATUS]      = asset.status;
-            row[COL.LOCATION]    = loc;
-            row[COL.REGION]      = asset.region;
-            row[COL.MANUFACTURER]= asset.manufacturer;
-            row[COL.MODEL]       = asset.model;
-            row[COL.OS]          = asset.os;
-            row[COL.OS_VERSION]  = asset.osVersion;
-            row[COL.OS_BUILD]    = asset.osBuild;
-            row[COL.CPU]         = asset.cpu;
-            row[COL.IP]          = asset.ip;
-            row[COL.MAC]         = asset.mac;
-            row[COL.NETWORK]     = asset.network;
-            row[COL.ANTIVIRUS]   = asset.antivirus;
-            row[COL.USERNAME]    = asset.username;
-            row[COL.ASSIGNED]    = asset.assigned;
-            row[COL.FIRST_SEEN]  = asset.firstSeen;
-            row[COL.LAST_SEEN]   = asset.lastSeen;
-            row[COL.PURCHASE]    = asset.purchase;
-            row[COL.WARRANTY]    = asset.warranty;
-            row[COL.TENANT_ID]   = asset.tenantId;
-            row[COL.LANSWEEPER]  = asset.lansweeper;
-            row[COL.SYNC_STATUS] = "JIRA";
-            row[COL.LAST_SYNC]   = now;
-            await appendRow(context, sheet, row);
-            // Update lookup so duplicates within same sync don't insert twice
-            byId[asset.id] = existing.length;
-            if (asset.serial) bySerial[asset.serial] = existing.length;
-            existing.push(row);
+            toInsert.push(assetToRow(asset, loc, now, null));
           }
+        });
 
-          syncState[li].done++;
-          if (syncState[li].done % 20 === 0) updateSyncPanel(syncPanel, syncState);
+        // ── BATCH UPDATE: ghi tất cả updates cùng lúc, không await từng cái ──
+        toUpdate.forEach(({ rowIdx, newRow }) => {
+          const range = sheet.getRangeByIndexes(rowIdx + 1, 0, 1, COL_COUNT);
+          range.values = [newRow];
+          // Không await ở đây — queue hết rồi sync 1 lần
+        });
+
+        // ── BATCH INSERT: ghi tất cả rows mới 1 lần ──
+        if (toInsert.length > 0) {
+          const used = sheet.getUsedRangeOrNullObject(true);
+          await context.sync(); // sync 1 lần để biết rowCount
+          let startRow = 1;
+          if (!used.isNullObject) {
+            used.load("rowCount");
+            await context.sync();
+            startRow = used.rowCount;
+          }
+          // Ghi toàn bộ rows mới 1 lần duy nhất
+          const insertRange = sheet.getRangeByIndexes(startRow, 0, toInsert.length, COL_COUNT);
+          insertRange.values = toInsert;
         }
 
+        // ── 1 context.sync() duy nhất để flush mọi thay đổi ──
+        await context.sync();
+
+        syncState[li].done   = assets.length;
         syncState[li].status = "done";
-        syncState[li].done   = syncState[li].total;
         updateSyncPanel(syncPanel, syncState);
-      }
-    });
+        console.log(`Sheet ${sheetName}: updated=${toUpdate.length}, inserted=${toInsert.length}`);
+      });
+    }
 
     // Persist last sync time
     cfg.lastSync = new Date().toISOString();
@@ -638,12 +639,13 @@ async function runSync() {
 
     setSyncIndicator("ok", "Synced");
     setInner("last-sync-time", formatTime(cfg.lastSync));
-    toast(`Sync complete — ${jiraAssets.length} assets across ${locations.length} location(s)`, "success");
+    toast(`Sync hoàn tất — ${jiraAssets.length} assets, ${locations.length} location(s)`, "success");
     await refreshDashboard();
 
   } catch(e) {
     setSyncIndicator("ok", "Sync failed");
     toast("Sync error: " + e.message, "error");
+    console.error("runSync error:", e);
   } finally {
     isSyncing = false;
   }
