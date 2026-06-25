@@ -1,6 +1,6 @@
 /* ════════════════════════════════════════════════════════════
    Jira Asset Manager — Office Add-in
-   taskpane.js — v3.0 (bypass-1000 via OS Version split)
+   taskpane.js — Full logic layer  (v1.2 - bypass 1000 limit)
    ════════════════════════════════════════════════════════════ */
 
 "use strict";
@@ -150,18 +150,24 @@ function populateConfigUI() {
 // EVENTS
 // ══════════════════════════════════════════════════════════════
 function wireEvents() {
+  // Tabs
   document.querySelectorAll(".tab").forEach(t =>
     t.addEventListener("click", () => switchTab(t.dataset.tab))
   );
+  // Dashboard
   on("btn-sync-now",       () => runSync());
   on("btn-validate-all",   () => runValidation());
   on("btn-open-jira",      openJira);
   on("btn-create-sheets",  createLocationSheets);
+  // Validation
   on("btn-run-validate",   () => runValidation());
+  // Ticket
   on("btn-scan-pending",   scanPendingRows);
   on("btn-create-tickets", createTickets);
+  // Sync tab
   on("btn-full-sync",      () => runSync());
   on("btn-sync-local",     matchLocalAssets);
+  // Settings
   on("btn-save-cfg",       saveConfig);
   on("btn-test-conn",      testConnection);
 }
@@ -182,8 +188,9 @@ function switchTab(tab) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// JIRA API — via Cloudflare Worker proxy (CORS)
+// JIRA API — via Cloudflare Worker proxy (CORS fix)
 // ══════════════════════════════════════════════════════════════
+
 function jiraBase() {
   return cfg.jiraUrl.replace(/\/+$/, "");
 }
@@ -243,44 +250,24 @@ async function assetsPost(path, body) {
   return res.json();
 }
 
-
 // ══════════════════════════════════════════════════════════════
-// FETCH ENGINE v3 — Bypass giới hạn 1000 record qua OS Version
-//
-// Quy trình cho mỗi objectTypeId:
-//   Bước 1  — Lấy totalCount của toàn typeId
-//   Bước 2  — Nếu < 1000: fetch thẳng, ghi Excel
-//   Bước 3  — Nếu >= 1000: discover OS Versions thực tế từ data
-//   Bước 4  — Với mỗi OS Version: check count, fetch nếu < 1000
-//   Bước 5  — Merge toàn bộ kết quả
-//   Bước 6  — Dedup theo objectKey
-//   Bước 7  — Kiểm tra expectedTotal === actualTotal
-//   Bước 8  — Ghi Excel (chỉ sau khi merge + check xong)
-//   Bước 9  — Chuyển sang typeId tiếp theo
+// FETCH HELPERS — low-level pagination
 // ══════════════════════════════════════════════════════════════
 
-// Attribute ID cho "Version OS" (Windows Version) = 27291
-const ATTR_OS_VERSION = "27291";
-
-/**
- * Bước 1 — Lấy totalCount của một AQL query.
- * POST /object/aql/totalcount — không tốn quota object.
- * Trả về số nguyên >= 0, hoặc -1 nếu API lỗi.
- */
+// Lấy tổng số records của 1 AQL query (không trả data)
 async function fetchTotalCount(qlQuery) {
-  try {
-    const data = await assetsPost("/object/aql/totalcount", { qlQuery });
-    return typeof data.totalCount === "number" ? data.totalCount : 0;
-  } catch (e) {
-    console.warn("fetchTotalCount error:", e.message);
-    return -1;
-  }
+  const res = await assetsPost("/object/aql/totalcount", { qlQuery });
+  // API trả về số nguyên hoặc object { count: N } tuỳ version
+  if (typeof res === "number") return res;
+  if (res && typeof res.count === "number") return res.count;
+  if (res && typeof res.totalCount === "number") return res.totalCount;
+  // Fallback: parse string
+  const val = parseInt(res, 10);
+  return isNaN(val) ? 0 : val;
 }
 
-/**
- * Fetch một page từ Assets AQL (internal).
- */
-async function fetchPage(qlQuery, startAt, pageSize = 25) {
+// Fetch 1 page từ Assets AQL
+async function fetchPage(qlQuery, startAt, pageSize) {
   return assetsPost("/object/aql", {
     qlQuery,
     startAt,
@@ -288,218 +275,232 @@ async function fetchPage(qlQuery, startAt, pageSize = 25) {
     includeAttributes: true,
   });
 }
+
+// Parse 1 object thành asset record
 function parseAsset(obj) {
-  const attrs = obj.attributes || [];
-
   const attrById = (id) => {
-    const a = attrs.find(x => String(x.objectTypeAttributeId) === String(id));
-    if (!a || !a.objectAttributeValues?.length) return "";
-
-    const v = a.objectAttributeValues[0];
-
-    return (
-      v.displayValue ??
-      v.searchValue ??
-      v.value ??
-      v.referencedObject?.label ??
-      ""
+    const a = (obj.attributes || []).find(
+      x => String(x.objectTypeAttributeId) === String(id)
     );
+    return a?.objectAttributeValues?.[0]?.displayValue || "";
   };
-
   return {
-    id:           String(obj.id || ""),
-    key:          obj.objectKey || "",
-    hostname:     attrById(1737) || obj.label || "",
-    serial:       attrById(5194),
-    status:       attrById(5052),
-    location:     attrById(30125),
-    region:       attrById(27292),
-
-    manufacturer: attrById(6608),
-    model:        attrById(6609),
-
-    os:           attrById(30345),
-    osVersion:    attrById(27291),
-    osBuild:      attrById(27290),
-
-    cpu:          attrById(6610),
-
-    ip:           attrById(5208),
-    mac:          attrById(5209),
-    network:      attrById(5210),
-
-    antivirus:    attrById(6612),
-
-    username:     attrById(5200),
-    assigned:     attrById(26690),
-
-    firstSeen:    attrById(5205),
-    lastSeen:     attrById(5206),
-
-    purchase:     attrById(5203),
-    warranty:     attrById(6615),
-
-    tenantId:     attrById(26398),
-    lansweeper:   attrById(5207),
+    id:          String(obj.id || ""),
+    key:         obj.objectKey || "",
+    hostname:    attrById(1737) || obj.label || "",
+    serial:      attrById(5194),
+    status:      attrById(5052),
+    location:    attrById(30125),
+    region:      attrById(27292),
+    manufacturer:attrById(6608),
+    model:       attrById(6609),
+    os:          attrById(30345),
+    osVersion:   attrById(27291),
+    osBuild:     attrById(27290),
+    cpu:         attrById(6610),
+    ip:          attrById(5208),
+    mac:         attrById(5209),
+    network:     attrById(5210),
+    antivirus:   attrById(6612),
+    username:    attrById(5200),
+    assigned:    attrById(26690),
+    firstSeen:   attrById(5205),
+    lastSeen:    attrById(5206),
+    purchase:    attrById(5203),
+    warranty:    attrById(6615),
+    tenantId:    attrById(26398),
+    lansweeper:  attrById(5207),
   };
 }
-/**
- * Fetch toàn bộ object của một AQL query đã đảm bảo count < 1000.
- * Pagination trong phạm vi startAt [0, 999].
- *
- * @param {string} qlQuery  - AQL đảm bảo count < 1000
- * @param {string} label    - Nhãn cho console log
- * @returns {Array}         - Mảng asset đã parse
- */
-async function fetchAllFromQuery(qlQuery, label = "") {
+
+// Fetch toàn bộ records của 1 AQL query (giả định totalCount < 1000)
+// Dùng pagination thông thường: startAt 0→25→50→...
+async function fetchAllUnderLimit(qlQuery) {
   const assets   = [];
   const pageSize = 25;
-  let   startAt  = 0;
+  let startAt    = 0;
 
   while (true) {
     const data   = await fetchPage(qlQuery, startAt, pageSize);
     const values = data.values || [];
+    if (values.length === 0) break;
     values.forEach(obj => assets.push(parseAsset(obj)));
-
-    if (values.length < pageSize) break;   // trang cuối
-
     startAt += values.length;
-    if (startAt >= 1000) {
-      // Query này count >= 1000 ngoài dự kiến — dừng để tránh miss data
-      console.warn(`[${label}] Reached startAt=${startAt} >= 1000. Query too broad.`);
-      break;
-    }
+    console.log(`  [fetchAllUnderLimit] ${qlQuery}: loaded=${assets.length}`);
+    if (values.length < pageSize) break;
   }
-
-  console.log(`  [${label}] fetched=${assets.length}`);
   return assets;
 }
 
-/**
- * Bước 3 — Discover các giá trị OS Version thực tế của một typeId.
- *
- * Scan tối đa 1000 object đầu, collect unique values của attr 27291.
- * Luôn thêm bucket "__EMPTY__" để capture object không có OS Version.
- *
- * @param {string} typeId
- * @returns {string[]}  - Danh sách OS Version values + "__EMPTY__"
- */
-async function discoverOsVersions(typeId) {
-  const versions = new Set();
-  const pageSize = 25;
-  let   startAt  = 0;
+// ══════════════════════════════════════════════════════════════
+// BƯỚC 3: Lấy danh sách OS Version từ 1 objectTypeId
+//
+// Chiến lược: fetch page đầu, sau đó đọc hết records để collect
+// tất cả unique values của attr 27291 (OS_VERSION).
+// Vì chúng ta cần biết VERSION trước khi sub-query, ta dùng
+// 1 pass nhỏ (maxResults=1000) để collect values — nhưng nếu
+// totalCount > 1000 chúng ta cần cách khác.
+//
+// Giải pháp: fetch toàn bộ OS_VERSION values bằng cách paginate
+// chỉ lấy attr 27291 (includeAttributes: true nhưng gọi nhiều page
+// — nếu totalCount > 1000 ta chỉ lấy được 1000 mẫu, đủ để biết
+// các version tồn tại).
+// Sau đó dùng "objectTypeId = X AND 'Windows Version' = Y" để
+// sub-query từng version — mỗi sub-query sẽ < 1000.
+//
+// Attr ID cho OS Version: 27291
+// Tên attribute trong AQL: "Windows Version"  (displayName)
+// ══════════════════════════════════════════════════════════════
+async function fetchOsVersions(typeId) {
+  // Lấy tối đa 1000 records (limit API) để collect unique OS version values
+  const data   = await fetchPage(`objectTypeId = ${typeId}`, 0, 1000);
+  const values = data.values || [];
+  const seen   = new Set();
 
-  while (startAt < 1000) {
-    const data   = await fetchPage(`objectTypeId = ${typeId}`, startAt, pageSize);
-    const values = data.values || [];
+  values.forEach(obj => {
+    const a = (obj.attributes || []).find(
+      x => String(x.objectTypeAttributeId) === "27291"
+    );
+    const v = a?.objectAttributeValues?.[0]?.displayValue || "";
+    seen.add(v); // "" = "Unknown / blank"
+  });
 
-    values.forEach(obj => {
-      const attr = (obj.attributes || []).find(
-        x => String(x.objectTypeAttributeId) === ATTR_OS_VERSION
-      );
-      const val = attr?.objectAttributeValues?.[0]?.displayValue;
-      if (val && val.trim()) versions.add(val.trim());
-    });
-
-    if (values.length < pageSize) break;
-    startAt += values.length;
-  }
-
-  const result = [...versions, "__EMPTY__"];
-  console.log(`[typeId=${typeId}] OS Versions discovered (${result.length}):`, result);
-  return result;
+  const versions = [...seen];
+  console.log(`  [fetchOsVersions] typeId=${typeId}: versions=[${versions.join(", ")}]`);
+  return versions;
 }
 
-/**
- * Bước 2–7 — Core engine cho một objectTypeId.
- *
- * - totalCount < 1000  → fetch thẳng
- * - totalCount >= 1000 → chia theo OS Version, mỗi bucket < 1000 → fetch
- * - Merge tất cả → dedup theo objectKey → integrity check
- *
- * @param {string} typeId
- * @returns {{ assets: Array, expectedTotal: number, ok: boolean }}
- */
-async function fetchOneTypeId(typeId) {
-  const baseAql       = `objectTypeId = ${typeId}`;
+// ══════════════════════════════════════════════════════════════
+// CORE: fetchByTypeId
+//
+// Bước 1–7 theo spec:
+//   1. Lấy totalCount
+//   2. Nếu < 1000 → fetch thẳng, return
+//   3. Lấy danh sách OS Version
+//   4. Sub-query từng version
+//   5. Merge toàn bộ
+//   6. Dedup bằng objectKey
+//   7. Kiểm tra integrity: uniqueCount === totalCount
+// ══════════════════════════════════════════════════════════════
+async function fetchByTypeId(typeId) {
+  const baseQuery = `objectTypeId = ${typeId}`;
 
-  // Bước 1: lấy totalCount
-  const expectedTotal = await fetchTotalCount(baseAql);
-  console.log(`\n══ typeId=${typeId} ══ expectedTotal=${expectedTotal}`);
-  toast(`[typeId=${typeId}] Tổng: ${expectedTotal} assets`, "warning");
+  // ── Bước 1: lấy totalCount ───────────────────────────────
+  const totalCount = await fetchTotalCount(baseQuery);
+  console.log(`[fetchByTypeId] typeId=${typeId}, totalCount=${totalCount}`);
+  toast(`objectTypeId=${typeId}: ${totalCount} records`, "warning");
 
-  let rawAssets = [];
+  // ── Bước 2: nếu < 1000, fetch thẳng ─────────────────────
+  if (totalCount < 1000) {
+    const assets = await fetchAllUnderLimit(baseQuery);
+    console.log(`[fetchByTypeId] typeId=${typeId}: fetched=${assets.length} (under limit)`);
+    return assets;
+  }
 
-  if (expectedTotal >= 0 && expectedTotal < 1000) {
-    // ── Bước 2: Dưới giới hạn → fetch thẳng ──────────────────
-    console.log(`  → Fetch thẳng (count < 1000)`);
-    rawAssets = await fetchAllFromQuery(baseAql, `typeId=${typeId}`);
+  // ── Bước 3: lấy danh sách OS Version ─────────────────────
+  toast(`objectTypeId=${typeId}: ${totalCount} records — phân chia theo OS Version...`, "warning");
+  const versions = await fetchOsVersions(typeId);
+  console.log(`[fetchByTypeId] typeId=${typeId}: ${versions.length} OS versions found`);
 
-  } else {
-    // ── Bước 3: >= 1000 → chia theo OS Version ────────────────
-    console.log(`  → count >= 1000, chia theo OS Version…`);
-    toast(`[typeId=${typeId}] Đang discover OS Versions…`, "warning");
+  // ── Bước 4 & 5: sub-query từng version, merge ────────────
+  const allAssets = [];
 
-    const osVersions = await discoverOsVersions(typeId);
+  for (let i = 0; i < versions.length; i++) {
+    const ver = versions[i];
 
-    // Bước 4: Với mỗi OS Version → check count → fetch
-    for (const ver of osVersions) {
-      const verAql = ver === "__EMPTY__"
-        ? `${baseAql} AND "Version OS" IS EMPTY`
-        : `${baseAql} AND "Version OS" = "${ver}"`;
+    // Build sub-query:
+    //   Nếu version là chuỗi rỗng → lấy những record không có OS Version
+    //   Nếu không rỗng → AND "Windows Version" = "..."
+    let subQuery;
+    if (ver === "") {
+      // Records không có giá trị OS Version
+      subQuery = `objectTypeId = ${typeId} AND "Windows Version" is EMPTY`;
+    } else {
+      // Escape dấu nháy kép bên trong value nếu có
+      const escaped = ver.replace(/"/g, '\\"');
+      subQuery = `objectTypeId = ${typeId} AND "Windows Version" = "${escaped}"`;
+    }
 
-      const verCount = await fetchTotalCount(verAql);
-      console.log(`  [Version OS="${ver}"] count=${verCount}`);
+    toast(`  [${i + 1}/${versions.length}] Fetching: ${ver || "(blank)"}...`, "warning");
+    console.log(`  [fetchByTypeId] sub-query: ${subQuery}`);
 
-      if (verCount === 0) continue;
+    // Kiểm tra sub-total trước khi fetch
+    const subTotal = await fetchTotalCount(subQuery);
+    console.log(`  [fetchByTypeId] "${ver}": subTotal=${subTotal}`);
 
-      if (verCount < 1000) {
-        // Bước 4a: An toàn → fetch trực tiếp
-        const bucket = await fetchAllFromQuery(verAql, `typeId=${typeId},ver=${ver}`);
-        rawAssets.push(...bucket);
-        toast(`  [typeId=${typeId}] "${ver}": ${bucket.length} assets`, "warning");
-      } else {
-        // Bucket vẫn >= 1000 — cảnh báo, fetch tối đa có thể
-        console.error(`  [WARN] "${ver}" count=${verCount} >= 1000. Fetch tối đa 999 records.`);
-        toast(`⚠ [typeId=${typeId}] "${ver}" có ${verCount} records >= 1000! Có thể thiếu data.`, "warning");
-        const bucket = await fetchAllFromQuery(verAql, `OVERFLOW:typeId=${typeId},ver=${ver}`);
-        rawAssets.push(...bucket);
-      }
+    if (subTotal === 0) {
+      console.warn(`  [fetchByTypeId] "${ver}": subTotal=0, bỏ qua`);
+      continue;
+    }
+
+    if (subTotal >= 1000) {
+      // Sub-query vẫn >= 1000 → cần phân chia thêm tầng nữa
+      // Fallback: thử phân chia theo OS_BUILD (attr 27290)
+      console.warn(`  [fetchByTypeId] "${ver}": subTotal=${subTotal} >= 1000, phân chia theo OS Build...`);
+      toast(`  "${ver}": ${subTotal} records — phân chia thêm theo OS Build...`, "warning");
+      const subAssets = await fetchByOsBuild(typeId, ver, subQuery);
+      subAssets.forEach(a => allAssets.push(a));
+    } else {
+      const subAssets = await fetchAllUnderLimit(subQuery);
+      console.log(`  [fetchByTypeId] "${ver}": fetched=${subAssets.length}`);
+      subAssets.forEach(a => allAssets.push(a));
     }
   }
 
-  // ── Bước 6: Dedup theo objectKey ──────────────────────────
-  // Dùng Map để giữ lại bản ghi cuối cùng của mỗi key (latest wins)
-  const uniqueAssets = [
-    ...new Map(rawAssets.map(a => [a.key || a.id, a])).values()
-  ];
+  // ── Bước 6: dedup bằng objectKey ─────────────────────────
+  const uniqueMap  = new Map(allAssets.map(a => [a.key || a.id, a]));
+  const uniqueAssets = [...uniqueMap.values()];
 
-  // ── Bước 7: Integrity check ────────────────────────────────
-  const actualTotal = uniqueAssets.length;
-  const ok          = expectedTotal < 0 || actualTotal === expectedTotal;
-
-  console.log(
-    `  Expected: ${expectedTotal} | Raw fetched: ${rawAssets.length} | ` +
-    `After dedup: ${actualTotal} | OK: ${ok}`
-  );
-
-  if (!ok) {
-    console.error(
-      `[typeId=${typeId}] ⚠ Missing records: expected=${expectedTotal}, actual=${actualTotal}, ` +
-      `missing=${expectedTotal - actualTotal}`
-    );
-    toast(
-      `⚠ [typeId=${typeId}] Thiếu ${expectedTotal - actualTotal} records (${actualTotal}/${expectedTotal})`,
-      "warning"
-    );
-  } else if (expectedTotal >= 0) {
-    console.log(`  ✓ Integrity OK: ${actualTotal} === ${expectedTotal}`);
+  // ── Bước 7: kiểm tra integrity ───────────────────────────
+  if (uniqueAssets.length !== totalCount) {
+    const msg = `[INTEGRITY] typeId=${typeId}: expected=${totalCount}, actual=${uniqueAssets.length}`;
+    console.error(msg);
+    toast(`⚠ ${msg}`, "warning");
+  } else {
+    console.log(`[fetchByTypeId] typeId=${typeId}: integrity OK (${uniqueAssets.length}/${totalCount})`);
   }
 
-  return { assets: uniqueAssets, expectedTotal, actualTotal, ok };
+  return uniqueAssets;
 }
 
-// ── Parse objectTypeIds từ AQL config ────────────────────────
+// ── Fallback: phân chia theo OS Build khi 1 OS Version vẫn >= 1000 ──
+async function fetchByOsBuild(typeId, osVersion, parentQuery) {
+  // Lấy mẫu để discover các build values
+  const data   = await fetchPage(parentQuery, 0, 1000);
+  const values = data.values || [];
+  const seen   = new Set();
+
+  values.forEach(obj => {
+    const a = (obj.attributes || []).find(
+      x => String(x.objectTypeAttributeId) === "27290"
+    );
+    const v = a?.objectAttributeValues?.[0]?.displayValue || "";
+    seen.add(v);
+  });
+
+  const builds    = [...seen];
+  const allAssets = [];
+
+  for (const build of builds) {
+    let subQuery;
+    if (build === "") {
+      subQuery = `${parentQuery} AND "Windows Build" is EMPTY`;
+    } else {
+      const escaped = build.replace(/"/g, '\\"');
+      subQuery = `${parentQuery} AND "Windows Build" = "${escaped}"`;
+    }
+    console.log(`    [fetchByOsBuild] sub-query: ${subQuery}`);
+    const subAssets = await fetchAllUnderLimit(subQuery);
+    console.log(`    [fetchByOsBuild] build="${build}": fetched=${subAssets.length}`);
+    subAssets.forEach(a => allAssets.push(a));
+  }
+
+  return allAssets;
+}
+
+// ══════════════════════════════════════════════════════════════
+// BƯỚC 9: fetchJiraAssets — iterate qua từng typeId
+// ══════════════════════════════════════════════════════════════
 function parseTypeIds() {
   const aqlRaw = (cfg.aqlQuery || "").trim();
   const m = aqlRaw.match(/objectTypeId\s+IN\s*\(([^)]+)\)/i);
@@ -509,67 +510,37 @@ function parseTypeIds() {
   return [];
 }
 
-/**
- * Fetch toàn bộ assets qua tất cả typeIds, xử lý tuần tự.
- * Mỗi typeId: fetch → dedup → check hoàn tất trước khi sang typeId tiếp.
- * Sau khi xong tất cả → merge global (dedup cross-typeId theo objectKey).
- *
- * @returns {{ allAssets: Array, stats: Array }}
- */
 async function fetchJiraAssets() {
   const typeIds = parseTypeIds();
   if (!typeIds.length) {
     toast("AQL Query chưa được cấu hình đúng", "error");
-    return { allAssets: [], stats: [] };
+    return [];
   }
 
-  // Global dedup: objectKey → asset (xử lý asset xuất hiện ở nhiều typeId)
-  const globalMap = new Map();
-  const stats     = [];
+  const seenIds   = new Set();
+  const allAssets = [];
 
   for (let i = 0; i < typeIds.length; i++) {
     const typeId = typeIds[i];
-    toast(`[${i+1}/${typeIds.length}] Bắt đầu typeId=${typeId}…`, "warning");
+    toast(`[${i + 1}/${typeIds.length}] Đang xử lý objectTypeId=${typeId}...`, "warning");
 
-    // Bước 2–7 cho typeId này (fetch + dedup + integrity check)
-    const result = await fetchOneTypeId(typeId);
+    // fetchByTypeId thực hiện Bước 1–7 cho từng typeId
+    const assets = await fetchByTypeId(typeId);
+    let added = 0;
 
-    // Merge vào global map
-    let crossAdded = 0;
-    result.assets.forEach(a => {
-      const key = a.key || a.id;
-      if (!globalMap.has(key)) {
-        globalMap.set(key, a);
-        crossAdded++;
-      }
+    assets.forEach(a => {
+      // Dedup global bằng id (để tránh trùng giữa các typeId)
+      if (seenIds.has(a.id)) return;
+      seenIds.add(a.id);
+      allAssets.push(a);
+      added++;
     });
 
-    stats.push({
-      typeId,
-      expectedTotal: result.expectedTotal,
-      actualTotal:   result.actualTotal,
-      addedGlobal:   crossAdded,
-      ok:            result.ok,
-    });
-
-    console.log(
-      `[typeId=${typeId}] DONE. addedGlobal=${crossAdded}. Global total so far: ${globalMap.size}`
-    );
-    // Bước 9: vòng lặp tự động chuyển sang typeId tiếp theo
+    console.log(`typeId=${typeId}: returned=${assets.length}, added=${added}, globalTotal=${allAssets.length}`);
   }
 
-  const allAssets = [...globalMap.values()];
-
-  console.log(`\nfetchJiraAssets DONE: ${allAssets.length} assets (${typeIds.length} typeId(s))`);
-  console.log("=== FETCH SUMMARY ===");
-  stats.forEach(s =>
-    console.log(
-      `  typeId=${s.typeId}: expected=${s.expectedTotal}, actual=${s.actualTotal}, ` +
-      `addedGlobal=${s.addedGlobal}, OK=${s.ok}`
-    )
-  );
-
-  return { allAssets, stats };
+  console.log(`fetchJiraAssets complete: ${allAssets.length} unique assets from ${typeIds.length} typeId(s)`);
+  return allAssets;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -609,10 +580,26 @@ async function readSheetRows(context, sheet) {
   const used = sheet.getUsedRangeOrNullObject(true);
   await context.sync();
   if (used.isNullObject) return [];
+
   used.load(["values", "rowCount"]);
   await context.sync();
+
   if (used.rowCount <= 1) return [];
   return used.values.slice(1);
+}
+
+async function appendRow(context, sheet, rowData) {
+  const used = sheet.getUsedRangeOrNullObject(true);
+  await context.sync();
+  let nextRow = 1;
+  if (!used.isNullObject) {
+    used.load("rowCount");
+    await context.sync();
+    nextRow = used.rowCount;
+  }
+  const range = sheet.getRangeByIndexes(nextRow, 0, 1, COL_COUNT);
+  range.values = [rowData];
+  await context.sync();
 }
 
 async function getLocationSheets(context) {
@@ -639,8 +626,8 @@ async function refreshDashboard() {
         total += rows.length;
         let locLocal = 0;
         rows.forEach(r => {
-          if (r[COL.SYNC_STATUS] === "LOCAL")                        { local++;  locLocal++; }
-          if (r[COL.VALIDATION]  && r[COL.VALIDATION] !== "OK")       mismatch++;
+          if (r[COL.SYNC_STATUS] === "LOCAL")                        { local++; locLocal++; }
+          if (r[COL.VALIDATION]  && r[COL.VALIDATION] !== "OK")      mismatch++;
           if (r[COL.ACTION] === "Create Ticket" && !r[COL.CASE_JIRA]) pending++;
         });
         locSummary.push({ name: sheetName, count: rows.length, local: locLocal });
@@ -681,8 +668,8 @@ async function createLocationSheets() {
   }
   toast("Fetching assets from Jira to discover locations...", "warning");
   try {
-    const { allAssets } = await fetchJiraAssets();
-    const locations = [...new Set(allAssets.map(a => a.location).filter(Boolean))];
+    const assets    = await fetchJiraAssets();
+    const locations = [...new Set(assets.map(a => a.location).filter(Boolean))];
 
     if (!locations.length) {
       toast("No locations found in Jira assets", "warning"); return;
@@ -703,7 +690,7 @@ async function createLocationSheets() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ASSET → ROW
+// SYNC ENGINE
 // ══════════════════════════════════════════════════════════════
 function assetToRow(asset, loc, now, existingRow) {
   const row = existingRow ? [...existingRow] : Array(COL_COUNT).fill("");
@@ -734,144 +721,77 @@ function assetToRow(asset, loc, now, existingRow) {
   row[COL.LANSWEEPER]   = asset.lansweeper;
   row[COL.SYNC_STATUS]  = "JIRA";
   row[COL.LAST_SYNC]    = now;
-  // Preserve user-entered fields from existing row
-  // COL.DAYS, COL.NOTE, COL.ACTION, COL.CASE_JIRA are already carried via existingRow spread
+  // COL.DAYS, COL.NOTE, COL.ACTION, COL.CASE_JIRA — preserved from existingRow
   return row;
 }
 
-// ══════════════════════════════════════════════════════════════
-// WRITE LOCATION SHEET
-// Upsert logic:
-//   - Match by Asset ID (primary) hoặc Serial (fallback)
-//   - UPDATE tại chỗ nếu đã tồn tại
-//   - INSERT batch cuối sheet nếu mới
-//   - Mark "Not in Jira" nếu row cũ không còn trong batch
-//
-// Ghi chú Excel batch:
-//   - Không dùng appendRow từng dòng (quá chậm)
-//   - Dùng getRangeByIndexes(startRow, 0, N, COL_COUNT).values = matrix
-// ══════════════════════════════════════════════════════════════
 async function writeLocationSheet(sheetName, assets, now) {
   await Excel.run(async (context) => {
     const sheet = await ensureSheet(context, sheetName);
     await ensureHeaders(context, sheet);
 
-    // Load existing rows
     const existing = await readSheetRows(context, sheet);
-
-    // Build lookup maps
-    const byId     = {};
-    const byKey    = {};
-    const bySerial = {};
+    const byId = {}, bySerial = {};
     existing.forEach((row, idx) => {
-      const id     = String(row[COL.ASSET_ID]   || "").trim();
-      const key    = String(row[COL.ASSET_KEY]  || "").trim();
-      const serial = String(row[COL.SERIAL]     || "").trim();
-      if (id)     byId[id]         = idx;
-      if (key)    byKey[key]       = idx;
-      if (serial) bySerial[serial] = idx;
+      const id  = String(row[COL.ASSET_ID] || "").trim();
+      const ser = String(row[COL.SERIAL]   || "").trim();
+      if (id)  byId[id]      = idx;
+      if (ser) bySerial[ser] = idx;
     });
 
-    // Track which existing rows were matched
-    const updatedIdxs = new Set();
-    // Track Asset IDs from Jira
     const jiraIdSet   = new Set(assets.map(a => a.id).filter(Boolean));
-    const jiraKeySet  = new Set(assets.map(a => a.key).filter(Boolean));
+    const updatedIdxs = new Set();
 
-    // ── A: UPDATE existing rows ──────────────────────────────
-    // Collect updates as { rowIdx, newRow } for batch write
-    const updates = [];
-
+    // A: UPDATE existing rows
     assets.forEach(asset => {
-      // Priority: ID → Key → Serial
-      let idx = -1;
-      if (asset.id   && byId[asset.id]       !== undefined) idx = byId[asset.id];
-      else if (asset.key && byKey[asset.key] !== undefined) idx = byKey[asset.key];
-      else if (asset.serial && bySerial[asset.serial] !== undefined) idx = bySerial[asset.serial];
-
+      const idx =
+        byId[asset.id] !== undefined                         ? byId[asset.id] :
+        asset.serial && bySerial[asset.serial] !== undefined ? bySerial[asset.serial] :
+        -1;
       if (idx >= 0) {
         const newRow = assetToRow(asset, asset.location || "", now, existing[idx]);
         if (newRow[COL.VALIDATION] === "Not in Jira") newRow[COL.VALIDATION] = "";
-        updates.push({ idx, newRow });
+        sheet.getRangeByIndexes(idx + 1, 0, 1, COL_COUNT).values = [newRow];
         updatedIdxs.add(idx);
       }
     });
 
-    // Batch write updates (one call per row — Excel.run context batches these)
-    for (const { idx, newRow } of updates) {
-      sheet.getRangeByIndexes(idx + 1, 0, 1, COL_COUNT).values = [newRow];
-    }
-
-    // ── B: Mark rows no longer in Jira ───────────────────────
+    // B: Mark rows không còn trong Jira
     existing.forEach((row, idx) => {
       if (updatedIdxs.has(idx))             return;
       if (row[COL.SYNC_STATUS] === "LOCAL") return;
-      const id  = String(row[COL.ASSET_ID]  || "").trim();
-      const key = String(row[COL.ASSET_KEY] || "").trim();
-      // Only mark if this row previously had a Jira ID/Key that is now gone
-      if (!id && !key) return;
-      if (id && jiraIdSet.has(id))   return;
-      if (key && jiraKeySet.has(key)) return;
+      const id = String(row[COL.ASSET_ID] || "").trim();
+      if (!id || jiraIdSet.has(id))         return;
       const cell = sheet.getRangeByIndexes(idx + 1, COL.VALIDATION, 1, 1);
-      cell.values           = [["Not in Jira"]];
+      cell.values = [["Not in Jira"]];
       cell.format.font.color = "#f59e0b";
     });
 
-    // ── C: INSERT new assets (batch) ─────────────────────────
-    const toInsert = assets.filter(a => {
-      if (a.id     && byId[a.id]       !== undefined) return false;
-      if (a.key    && byKey[a.key]     !== undefined) return false;
-      if (a.serial && bySerial[a.serial] !== undefined) return false;
-      return true;
-    });
-
+    // C: INSERT rows mới
+    const toInsert = assets.filter(a =>
+      byId[a.id] === undefined &&
+      !(a.serial && bySerial[a.serial] !== undefined)
+    );
     if (toInsert.length > 0) {
-      // Find next empty row after used range
       const used = sheet.getUsedRangeOrNullObject(true);
       await context.sync();
-      let startRow = 1; // row after header
+      let startRow = 1;
       if (!used.isNullObject) {
         used.load("rowCount");
         await context.sync();
         startRow = used.rowCount;
       }
-
-      // Batch insert all new rows in ONE range write
-      const matrix = toInsert.map(a => assetToRow(a, a.location || "", now, null));
-      sheet.getRangeByIndexes(startRow, 0, matrix.length, COL_COUNT).values = matrix;
+      sheet.getRangeByIndexes(startRow, 0, toInsert.length, COL_COUNT).values =
+        toInsert.map(a => assetToRow(a, a.location || "", now, null));
     }
 
     await context.sync();
-
-    // ── D: Integrity check ───────────────────────────────────
-    const afterRows = await readSheetRows(context, sheet);
-    const sheetCount = afterRows.length;
-
-    console.log(
-      `[${sheetName}] updated=${updates.length} | inserted=${toInsert.length} | ` +
-      `sheetRows=${sheetCount} | jiraAssets=${assets.length}`
-    );
-
-    if (sheetCount < assets.length) {
-      console.error(
-        `[${sheetName}] ⚠ INTEGRITY: sheetRows(${sheetCount}) < jiraAssets(${assets.length}). ` +
-        `Missing ${assets.length - sheetCount} rows.`
-      );
-    }
+    console.log(`${sheetName}: updated=${updatedIdxs.size}, inserted=${toInsert.length}`);
   });
 }
 
-// ══════════════════════════════════════════════════════════════
-// SYNC ENGINE — Main entry point
-//
-// Quy trình:
-//   1. Với mỗi typeId: fetch (bypass-1000) → merge → dedup → check
-//   2. Bước 8: Ghi Excel chỉ sau khi typeId đó hoàn tất hoàn toàn
-//   3. Bước 9: Chuyển sang typeId tiếp theo
-//   4. Sau tất cả typeIds: verify Excel row count
-// ══════════════════════════════════════════════════════════════
 async function runSync() {
-  if (isSyncing) { toast("Sync đang chạy, vui lòng chờ…", "warning"); return; }
+  if (isSyncing) { toast("Sync already running", "warning"); return; }
   if (!cfg.jiraUrl || !cfg.token || !cfg.workerUrl) {
     toast("Kiểm tra lại Settings (URL, token, worker)", "warning"); return;
   }
@@ -879,129 +799,70 @@ async function runSync() {
   isSyncing = true;
   setSyncIndicator("syncing", "Syncing...");
   const syncPanel = document.getElementById("sync-location-list");
-  if (syncPanel) {
-    syncPanel.innerHTML = `<div class="empty-state"><div class="spinner"></div>Đang tải từ Jira...</div>`;
-  }
+  syncPanel.innerHTML = `<div class="empty-state"><div class="spinner"></div>Đang tải từ Jira...</div>`;
 
   try {
     const typeIds = parseTypeIds();
     if (!typeIds.length) {
-      toast("AQL Query chưa đúng — cần objectTypeId IN (...) hoặc objectTypeId = N", "error");
+      toast("AQL Query chưa đúng — cần objectTypeId IN (...)", "error");
       return;
     }
 
-    const now        = new Date().toISOString();
-    const syncedInfo = []; // { typeId, sheetName, expected, actual, sheetRows }
+    // locationMap: sheetName → Map<assetKey, asset>  (dedup bằng key)
+    const locationMap = {};
+    const seenIds     = new Set();
+    let totalFetched  = 0;
+    const now         = new Date().toISOString();
 
-    // ══ Bước 2–9: Xử lý tuần tự từng typeId ══════════════════
     for (let i = 0; i < typeIds.length; i++) {
-      const typeId    = typeIds[i];
-      const sheetName = `_TYPE_${typeId}`;
+      const typeId = typeIds[i];
+      toast(`[${i + 1}/${typeIds.length}] Đang xử lý objectTypeId=${typeId}...`, "warning");
 
-      toast(`[${i+1}/${typeIds.length}] Đang xử lý typeId=${typeId}…`, "warning");
+      // fetchByTypeId thực hiện đầy đủ Bước 1–7
+      const assets = await fetchByTypeId(typeId);
+      let added = 0;
 
-      if (syncPanel) {
-        updateSyncPanel(syncPanel, typeIds.map((tid, j) => ({
-          name:   `_TYPE_${tid}`,
-          done:   0,
-          total:  0,
-          status: j < i ? "done" : (j === i ? "running" : "waiting"),
-        })));
-      }
+      assets.forEach(a => {
+        if (seenIds.has(a.id)) return;
+        seenIds.add(a.id);
+        added++;
+        totalFetched++;
 
-      // Bước 2–7: fetch + dedup + integrity check cho typeId này
-      const result = await fetchOneTypeId(typeId);
-      const assets  = result.assets; // đã dedup, đã integrity-check
-
-      // Bước 8: Ghi Excel SAU KHI merge + check xong
-      // (không ghi từng OS-version bucket riêng lẻ)
-      toast(
-        `[typeId=${typeId}] Ghi ${assets.length} assets vào sheet ${sheetName}…`,
-        "warning"
-      );
-      await writeLocationSheet(sheetName, assets, now);
-
-      // Đếm rows thực tế trong sheet để verify
-      let sheetRows = 0;
-      await Excel.run(async (context) => {
-        const sheet = context.workbook.worksheets.getItem(sheetName);
-        const rows  = await readSheetRows(context, sheet);
-        sheetRows   = rows.length;
+        const sheetName = locationSheetName((a.location || "UNKNOWN").trim());
+        if (!locationMap[sheetName]) locationMap[sheetName] = new Map();
+        locationMap[sheetName].set(a.key || a.id, a);
       });
 
-      // Log bước 8: so sánh jiraAssets vs sheetRows
-      console.log(
-        `\n=== EXCEL WRITE — typeId=${typeId} ===\n` +
-        `  TotalCount Jira : ${result.expectedTotal}\n` +
-        `  Total fetched   : ${result.actualTotal}\n` +
-        `  Total inserted  : ${assets.length}\n` +
-        `  Total rows sheet: ${sheetRows}`
-      );
+      console.log(`typeId=${typeId}: fetched=${assets.length}, added=${added}, total=${totalFetched}`);
 
-      if (sheetRows < assets.length) {
-        console.error(
-          `[typeId=${typeId}] ⚠ sheetRows(${sheetRows}) < jiraAssets(${assets.length}). ` +
-          `Missing ${assets.length - sheetRows} rows in Excel.`
-        );
-        toast(`⚠ [typeId=${typeId}] Ghi thiếu ${assets.length - sheetRows} rows vào Excel!`, "warning");
+      // Update UI panel
+      const sheetNames = Object.keys(locationMap);
+      const uiState = sheetNames.map(s => ({
+        name: s.replace(/^_/, ""),
+        done: locationMap[s].size,
+        total: locationMap[s].size,
+        status: i < typeIds.length - 1 ? "running" : "done",
+      }));
+      updateSyncPanel(syncPanel, uiState);
+
+      // Ghi vào Excel sau mỗi typeId
+      for (const sheetName of sheetNames) {
+        const sheetAssets = Array.from(locationMap[sheetName].values());
+        await writeLocationSheet(sheetName, sheetAssets, now);
       }
-
-      syncedInfo.push({
-        typeId,
-        sheetName,
-        expected: result.expectedTotal,
-        actual:   result.actualTotal,
-        ok:       result.ok,
-        sheetRows,
-      });
-
-      // Bước 9: vòng lặp for tự động chuyển sang typeId tiếp theo
-    }
-
-    // ══ Tổng kết sau tất cả typeIds ══════════════════════════
-    const totalExpected = syncedInfo.reduce((s, x) => s + (x.expected >= 0 ? x.expected : 0), 0);
-    const totalActual   = syncedInfo.reduce((s, x) => s + x.actual,   0);
-    const totalSheetRows = syncedInfo.reduce((s, x) => s + x.sheetRows, 0);
-
-    console.log(`\n=== SYNC HOÀN TẤT ===`);
-    console.log(`TotalCount Jira (sum) : ${totalExpected}`);
-    console.log(`Total fetched (deduped): ${totalActual}`);
-    console.log(`Total rows trong Excel : ${totalSheetRows}`);
-    syncedInfo.forEach(s =>
-      console.log(
-        `  typeId=${s.typeId} [${s.sheetName}]: expected=${s.expected}, ` +
-        `actual=${s.actual}, sheetRows=${s.sheetRows}, OK=${s.ok}`
-      )
-    );
-
-    const allOk = syncedInfo.every(s => s.ok) && totalSheetRows >= totalActual;
-
-    if (syncPanel) {
-      updateSyncPanel(syncPanel, syncedInfo.map(s => ({
-        name:   s.sheetName,
-        done:   s.sheetRows,
-        total:  s.expected >= 0 ? s.expected : s.actual,
-        status: s.ok ? "done" : "error",
-      })));
     }
 
     // Push LOCAL rows lên Jira
-    toast("Đang push LOCAL assets lên Jira…", "warning");
+    toast("Đang push LOCAL assets lên Jira...", "warning");
     await pushLocalAssets();
 
-    // Lưu timestamp
     cfg.lastSync = new Date().toISOString();
     Office.context.document.settings.set(CFG_KEYS.LAST_SYNC, cfg.lastSync);
     Office.context.document.settings.saveAsync();
 
     setSyncIndicator("ok", "Synced");
     setInner("last-sync-time", formatTime(cfg.lastSync));
-    toast(
-      `✓ Sync hoàn tất — ${totalActual} assets, ${typeIds.length} typeId(s), ${totalSheetRows} rows trong Excel` +
-      (allOk ? "" : " ⚠ Có lỗi, kiểm tra console"),
-      allOk ? "success" : "warning"
-    );
-
+    toast(`Sync hoàn tất — ${totalFetched} assets, ${Object.keys(locationMap).length} location(s)`, "success");
     await refreshDashboard();
 
   } catch(e) {
@@ -1013,9 +874,7 @@ async function runSync() {
   }
 }
 
-// ══════════════════════════════════════════════════════════════
-// PUSH LOCAL ASSETS → JIRA
-// ══════════════════════════════════════════════════════════════
+// ── Push LOCAL rows lên Jira Assets ───────────────────────────
 async function pushLocalAssets() {
   if (!cfg.cloudId || !cfg.workspaceId) return;
   const typeIds       = parseTypeIds();
@@ -1033,7 +892,7 @@ async function pushLocalAssets() {
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
           if (row[COL.SYNC_STATUS] !== "LOCAL") continue;
-          if (row[COL.ASSET_ID])               continue; // already pushed
+          if (row[COL.ASSET_ID])               continue;
 
           const hostname = String(row[COL.HOSTNAME] || "").trim();
           const serial   = String(row[COL.SERIAL]   || "").trim();
@@ -1068,17 +927,14 @@ async function pushLocalAssets() {
             }
           } catch(e) {
             failed++;
-            console.warn(`pushLocal row ${i+2} in ${sheetName}:`, e.message);
+            console.warn(`pushLocal row ${i + 2} in ${sheetName}:`, e.message);
           }
         }
       }
     });
-
     if (pushed > 0 || failed > 0) {
-      toast(
-        `LOCAL push: ${pushed} thành công${failed ? ", " + failed + " lỗi" : ""}`,
-        failed ? "warning" : "success"
-      );
+      toast(`LOCAL push: ${pushed} thành công${failed ? ", " + failed + " lỗi" : ""}`,
+        failed ? "warning" : "success");
     }
   } catch(e) {
     console.warn("pushLocalAssets:", e.message);
@@ -1089,7 +945,7 @@ function updateSyncPanel(el, state) {
   el.innerHTML = state.map(l => `
     <div class="location-item">
       <div class="loc-header">
-        <span class="loc-name">${l.name}</span>
+        <span class="loc-name">_${l.name}</span>
         <span class="loc-status ${l.status}">
           ${l.status === "done" ? "Done" : l.status === "running" ? "Running…" : "Waiting"}
         </span>
@@ -1111,9 +967,9 @@ async function matchLocalAssets() {
   }
   toast("Scanning LOCAL assets for Jira matches…", "warning");
   try {
-    const { allAssets } = await fetchJiraAssets();
-    const jiraBySerial  = {};
-    allAssets.forEach(a => { if (a.serial) jiraBySerial[a.serial.trim()] = a; });
+    const jiraAssets   = await fetchJiraAssets();
+    const jiraBySerial = {};
+    jiraAssets.forEach(a => { if (a.serial) jiraBySerial[a.serial.trim()] = a; });
 
     let matched = 0;
     await Excel.run(async (context) => {
@@ -1178,9 +1034,9 @@ async function runValidation() {
         const rows  = await readSheetRows(context, sheet);
 
         for (let i = 0; i < rows.length; i++) {
-          const row      = rows[i];
-          const serial   = String(row[COL.SERIAL]   || "").trim();
-          const assetId  = String(row[COL.ASSET_ID] || "").trim();
+          const row     = rows[i];
+          const serial  = String(row[COL.SERIAL]   || "").trim();
+          const assetId = String(row[COL.ASSET_ID] || "").trim();
           const locField = String(row[COL.LOCATION] || "").trim();
           let valid = "OK";
 
@@ -1208,7 +1064,7 @@ async function runValidation() {
           }
 
           const cell = sheet.getRangeByIndexes(i + 1, COL.VALIDATION, 1, 1);
-          cell.values            = [[valid]];
+          cell.values = [[valid]];
           cell.format.font.color = valid === "OK" ? "#22c55e" : "#ef4444";
         }
         await context.sync();
@@ -1226,7 +1082,7 @@ async function runValidation() {
 function renderValidationList(errors) {
   const el    = document.getElementById("val-list");
   const items = Object.entries(errors).map(([name, list]) => {
-    const count  = list.length;
+    const count = list.length;
     const unique = list.filter((v, i, a) =>
       i === a.findIndex(x => x.sheet === v.sheet && x.row === v.row)
     );
@@ -1304,9 +1160,9 @@ async function createTickets() {
 
           const deviceName = row[COL.HOSTNAME] || row[COL.ASSET_KEY] || "Unknown";
           const email      = row[COL.ASSIGNED] || row[COL.USERNAME] || "";
-          const serial     = row[COL.SERIAL]   || "";
-          const note       = row[COL.NOTE]     || "";
-          const rowDays    = row[COL.DAYS]     || days;
+          const serial     = row[COL.SERIAL]      || "";
+          const note       = row[COL.NOTE]        || "";
+          const rowDays    = row[COL.DAYS]        || days;
 
           const ticketBody = {
             fields: {
@@ -1327,7 +1183,7 @@ async function createTickets() {
           };
 
           try {
-            const res = await jiraPost("/api/3/issue", ticketBody);
+            const res      = await jiraPost("/api/3/issue", ticketBody);
             const ticketKey = res.key || "";
 
             if (ticketKey) {
@@ -1348,7 +1204,7 @@ async function createTickets() {
     });
 
     toast(
-      `Done — created: ${created}, skipped: ${skipped}${failed ? ", failed: " + failed : ""}`,
+      `Done — created: ${created}, skipped (duplicate): ${skipped}${failed ? ", failed: " + failed : ""}`,
       failed ? "warning" : "success"
     );
     scanPendingRows();
@@ -1382,10 +1238,10 @@ async function testConnection() {
     const me = await jiraGet("/api/3/myself");
     let assetsOk = "";
     try {
-      const countData = await assetsPost("/object/aql/totalcount", { qlQuery: "objectType != null" });
-      assetsOk = ` · Assets API ✓ (${countData.totalCount ?? "?"} objects total)`;
+      await assetsPost(`/object/aql?startAt=0&maxResults=1`, { qlQuery: "objectType != null" });
+      assetsOk = " · Assets API ✓";
     } catch(ae) {
-      assetsOk = ` · Assets API ✗ (${ae.message.slice(0,60)})`;
+      assetsOk = ` · Assets API ✗ (${ae.message.slice(0, 60)})`;
     }
     el.innerHTML     = `✓ Connected as <strong>${me.displayName || me.emailAddress || "Unknown"}</strong>${assetsOk}`;
     el.style.borderColor = "var(--green)";
