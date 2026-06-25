@@ -698,16 +698,18 @@ async function writeLocationSheet(sheetName, assets, now) {
     const jiraIdSet   = new Set(assets.map(a => a.id).filter(Boolean));
     const updatedIdxs = new Set();
 
-    // A: UPDATE existing rows
+    // A: UPDATE existing rows — chỉ cập nhật LAST_SYNC, giữ nguyên mọi thứ khác
     assets.forEach(asset => {
       const idx =
         byId[asset.id] !== undefined                         ? byId[asset.id] :
         asset.serial && bySerial[asset.serial] !== undefined ? bySerial[asset.serial] :
         -1;
       if (idx >= 0) {
-        const newRow = assetToRow(asset, asset.location || "", now, existing[idx]);
-        if (newRow[COL.VALIDATION] === "Not in Jira") newRow[COL.VALIDATION] = "";
-        sheet.getRangeByIndexes(idx + 1, 0, 1, COL_COUNT).values = [newRow];
+        sheet.getRangeByIndexes(idx + 1, COL.LAST_SYNC, 1, 1).values = [[now]];
+        // Xoá flag "Not in Jira" nếu asset đã quay lại Jira
+        if (String(existing[idx][COL.VALIDATION] || "") === "Not in Jira") {
+          sheet.getRangeByIndexes(idx + 1, COL.VALIDATION, 1, 1).values = [[""]];
+        }
         updatedIdxs.add(idx);
       }
     });
@@ -795,8 +797,15 @@ async function runSync() {
 
       console.log(`typeId=${typeId}: fetched=${assets.length}, added=${added}, total=${totalFetched}`);
 
-      // Update UI panel (chỉ UI, chưa ghi Excel)
+      // Ghi Excel ngay sau mỗi typeId — đợi xong mới tiếp typeId tiếp theo
       const sheetNames = Object.keys(locationMap);
+      toast(`Đang ghi ${sheetNames.length} sheet(s) cho typeId=${typeId}...`, "warning");
+      for (const sheetName of sheetNames) {
+        const sheetAssets = Array.from(locationMap[sheetName].values());
+        await writeLocationSheet(sheetName, sheetAssets, now);
+      }
+
+      // Update UI panel sau khi ghi xong
       const uiState = sheetNames.map(s => ({
         name: s.replace(/^_/, ""),
         done: locationMap[s].size,
@@ -804,13 +813,9 @@ async function runSync() {
         status: i < typeIds.length - 1 ? "running" : "done",
       }));
       updateSyncPanel(syncPanel, uiState);
-    }
 
-    // FIX Bug 3: Ghi vào Excel SAU KHI đã gom đủ tất cả typeId
-    toast("Đang ghi vào Excel...", "warning");
-    for (const [sheetName, assetMap] of Object.entries(locationMap)) {
-      const sheetAssets = Array.from(assetMap.values());
-      await writeLocationSheet(sheetName, sheetAssets, now);
+      // Reset locationMap để typeId tiếp theo không ghi đè sheet cũ
+      sheetNames.forEach(s => { locationMap[s] = new Map(); });
     }
 
     toast("Đang push LOCAL assets lên Jira...", "warning");
