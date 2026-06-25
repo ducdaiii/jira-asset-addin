@@ -288,7 +288,61 @@ async function fetchPage(qlQuery, startAt, pageSize = 25) {
     includeAttributes: true,
   });
 }
+function parseAsset(obj) {
+  const attrs = obj.attributes || [];
 
+  const attrById = (id) => {
+    const a = attrs.find(x => String(x.objectTypeAttributeId) === String(id));
+    if (!a || !a.objectAttributeValues?.length) return "";
+
+    const v = a.objectAttributeValues[0];
+
+    return (
+      v.displayValue ??
+      v.searchValue ??
+      v.value ??
+      v.referencedObject?.label ??
+      ""
+    );
+  };
+
+  return {
+    id:           String(obj.id || ""),
+    key:          obj.objectKey || "",
+    hostname:     attrById(1737) || obj.label || "",
+    serial:       attrById(5194),
+    status:       attrById(5052),
+    location:     attrById(30125),
+    region:       attrById(27292),
+
+    manufacturer: attrById(6608),
+    model:        attrById(6609),
+
+    os:           attrById(30345),
+    osVersion:    attrById(27291),
+    osBuild:      attrById(27290),
+
+    cpu:          attrById(6610),
+
+    ip:           attrById(5208),
+    mac:          attrById(5209),
+    network:      attrById(5210),
+
+    antivirus:    attrById(6612),
+
+    username:     attrById(5200),
+    assigned:     attrById(26690),
+
+    firstSeen:    attrById(5205),
+    lastSeen:     attrById(5206),
+
+    purchase:     attrById(5203),
+    warranty:     attrById(6615),
+
+    tenantId:     attrById(26398),
+    lansweeper:   attrById(5207),
+  };
+}
 /**
  * Fetch toàn bộ object của một AQL query đã đảm bảo count < 1000.
  * Pagination trong phạm vi startAt [0, 999].
