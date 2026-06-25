@@ -7,29 +7,50 @@
 
 // ── COLUMN MAP ────────────────────────────────────────────────
 const COL = {
-  ASSET_ID:    0,
-  ASSET_KEY:   1,
-  DEVICE_NAME: 2,
-  SERIAL:      3,
-  USER_EMAIL:  4,
-  MODEL:       5,
-  LOCATION:    6,
-  STATUS:      7,
-  DAYS:        8,
-  NOTE:        9,
-  CASE_JIRA:   10,
-  VALIDATION:  11,
-  SYNC_STATUS: 12,
-  LAST_SYNC:   13,
-  ACTION:      14,
+  ASSET_ID:    0,   // Jira Object ID
+  ASSET_KEY:   1,   // Jira Object Key
+  HOSTNAME:    2,   // attr 1737
+  SERIAL:      3,   // attr 5194
+  STATUS:      4,   // attr 5052
+  LOCATION:    5,   // attr 30125
+  REGION:      6,   // attr 27292
+  MANUFACTURER:7,   // attr 6608
+  MODEL:       8,   // attr 6609
+  OS:          9,   // attr 30345
+  OS_VERSION:  10,  // attr 27291
+  OS_BUILD:    11,  // attr 27290
+  CPU:         12,  // attr 6610
+  IP:          13,  // attr 5208
+  MAC:         14,  // attr 5209
+  NETWORK:     15,  // attr 5210
+  ANTIVIRUS:   16,  // attr 6612
+  USERNAME:    17,  // attr 5200
+  ASSIGNED:    18,  // attr 26690
+  FIRST_SEEN:  19,  // attr 5205
+  LAST_SEEN:   20,  // attr 5206
+  PURCHASE:    21,  // attr 5203
+  WARRANTY:    22,  // attr 6615
+  TENANT_ID:   23,  // attr 26398
+  LANSWEEPER:  24,  // attr 5207
+  // ── User-entered cols ──
+  DAYS:        25,
+  NOTE:        26,
+  CASE_JIRA:   27,
+  VALIDATION:  28,
+  SYNC_STATUS: 29,
+  LAST_SYNC:   30,
+  ACTION:      31,
 };
-const COL_COUNT = 15;
+const COL_COUNT = 32;
 
 const HEADERS = [
-  "Asset ID","Asset Key","Device Name","Serial Number",
-  "User Email","Model","Location","Status",
-  "Days","Note","Case Jira","Validation",
-  "Sync Status","Last Sync","Action"
+  "Asset ID","Asset Key","Hostname","Serial Number",
+  "Status","Location","Region","Manufacturer","Model",
+  "Operating System","Windows Version","Windows Build","CPU",
+  "IP Address","MAC Address","Network Name","Antivirus",
+  "Username","Assigned User","First Seen","Last Seen",
+  "Purchase Date","Warranty Expire","Tenant ID / Source ID","Lansweeper URL",
+  "Days","Note","Case Jira","Validation","Sync Status","Last Sync","Action"
 ];
 
 // ── CONFIG KEYS ───────────────────────────────────────────────
@@ -236,14 +257,14 @@ async function assetsPost(path, body) {
   return res.json();
 }
 
-// ── Fetch all assets via AQL pagination ──────────────────────
-// Endpoint: POST /object/aql  (params trong body, không phải query string)
+// ── Fetch ALL assets via AQL pagination (lấy hết, không giới hạn) ──
 async function fetchJiraAssets() {
   const assets = [];
   let startAt = 0;
-  const pageSize = 50;
+  const pageSize = 25; // Jira Assets API thường giới hạn 25/page
+  let total = Infinity;
 
-  while (true) {
+  while (startAt < total) {
     const data = await assetsPost("/object/aql", {
       qlQuery:           cfg.aqlQuery || "objectTypeId IN (525,527,529)",
       startAt:           startAt,
@@ -251,23 +272,47 @@ async function fetchJiraAssets() {
       includeAttributes: true,
     });
 
+    // Lấy total từ response để biết còn bao nhiêu trang
+    total = data.total ?? data.totalObjects ?? (data.values?.length ?? 0);
+    if (total === 0) break;
+
     const values = data.values || [];
+    if (values.length === 0) break; // không còn data
+
     values.forEach(obj => {
-      const attr = (key) => {
+      // Lookup by attribute ID (ổn định hơn tên)
+      const attrById = (id) => {
         const a = (obj.attributes || []).find(
-          x => x.objectTypeAttributeName === key
+          x => String(x.objectTypeAttributeId) === String(id)
         );
         return a?.objectAttributeValues?.[0]?.displayValue || "";
       };
       assets.push({
-        id:       String(obj.id   || ""),
-        key:      obj.objectKey   || "",
-        name:     attr("Name")    || obj.label || "",
-        serial:   attr("Serial Number") || attr("SerialNumber") || "",
-        email:    attr("User")    || attr("Owner") || attr("Email") || "",
-        model:    attr("Model")   || "",
-        location: attr("Location")|| "",
-        status:   attr("Status")  || "",
+        id:          String(obj.id || ""),
+        key:         obj.objectKey || "",
+        hostname:    attrById(1737) || obj.label || "",
+        serial:      attrById(5194),
+        status:      attrById(5052),
+        location:    attrById(30125),
+        region:      attrById(27292),
+        manufacturer:attrById(6608),
+        model:       attrById(6609),
+        os:          attrById(30345),
+        osVersion:   attrById(27291),
+        osBuild:     attrById(27290),
+        cpu:         attrById(6610),
+        ip:          attrById(5208),
+        mac:         attrById(5209),
+        network:     attrById(5210),
+        antivirus:   attrById(6612),
+        username:    attrById(5200),
+        assigned:    attrById(26690),
+        firstSeen:   attrById(5205),
+        lastSeen:    attrById(5206),
+        purchase:    attrById(5203),
+        warranty:    attrById(6615),
+        tenantId:    attrById(26398),
+        lansweeper:  attrById(5207),
       });
     });
 
@@ -497,12 +542,29 @@ async function runSync() {
             const cur = updateRange.values[0];
             cur[COL.ASSET_ID]    = asset.id;
             cur[COL.ASSET_KEY]   = asset.key;
-            cur[COL.DEVICE_NAME] = asset.name;
+            cur[COL.HOSTNAME]    = asset.hostname;
             cur[COL.SERIAL]      = asset.serial;
-            cur[COL.USER_EMAIL]  = asset.email;
-            cur[COL.MODEL]       = asset.model;
-            cur[COL.LOCATION]    = loc;
             cur[COL.STATUS]      = asset.status;
+            cur[COL.LOCATION]    = loc;
+            cur[COL.REGION]      = asset.region;
+            cur[COL.MANUFACTURER]= asset.manufacturer;
+            cur[COL.MODEL]       = asset.model;
+            cur[COL.OS]          = asset.os;
+            cur[COL.OS_VERSION]  = asset.osVersion;
+            cur[COL.OS_BUILD]    = asset.osBuild;
+            cur[COL.CPU]         = asset.cpu;
+            cur[COL.IP]          = asset.ip;
+            cur[COL.MAC]         = asset.mac;
+            cur[COL.NETWORK]     = asset.network;
+            cur[COL.ANTIVIRUS]   = asset.antivirus;
+            cur[COL.USERNAME]    = asset.username;
+            cur[COL.ASSIGNED]    = asset.assigned;
+            cur[COL.FIRST_SEEN]  = asset.firstSeen;
+            cur[COL.LAST_SEEN]   = asset.lastSeen;
+            cur[COL.PURCHASE]    = asset.purchase;
+            cur[COL.WARRANTY]    = asset.warranty;
+            cur[COL.TENANT_ID]   = asset.tenantId;
+            cur[COL.LANSWEEPER]  = asset.lansweeper;
             cur[COL.SYNC_STATUS] = "JIRA";
             cur[COL.LAST_SYNC]   = now;
             // cur[COL.DAYS], cur[COL.NOTE], cur[COL.ACTION] — intentionally preserved
@@ -513,12 +575,29 @@ async function runSync() {
             const row             = Array(COL_COUNT).fill("");
             row[COL.ASSET_ID]    = asset.id;
             row[COL.ASSET_KEY]   = asset.key;
-            row[COL.DEVICE_NAME] = asset.name;
+            row[COL.HOSTNAME]    = asset.hostname;
             row[COL.SERIAL]      = asset.serial;
-            row[COL.USER_EMAIL]  = asset.email;
-            row[COL.MODEL]       = asset.model;
-            row[COL.LOCATION]    = loc;
             row[COL.STATUS]      = asset.status;
+            row[COL.LOCATION]    = loc;
+            row[COL.REGION]      = asset.region;
+            row[COL.MANUFACTURER]= asset.manufacturer;
+            row[COL.MODEL]       = asset.model;
+            row[COL.OS]          = asset.os;
+            row[COL.OS_VERSION]  = asset.osVersion;
+            row[COL.OS_BUILD]    = asset.osBuild;
+            row[COL.CPU]         = asset.cpu;
+            row[COL.IP]          = asset.ip;
+            row[COL.MAC]         = asset.mac;
+            row[COL.NETWORK]     = asset.network;
+            row[COL.ANTIVIRUS]   = asset.antivirus;
+            row[COL.USERNAME]    = asset.username;
+            row[COL.ASSIGNED]    = asset.assigned;
+            row[COL.FIRST_SEEN]  = asset.firstSeen;
+            row[COL.LAST_SEEN]   = asset.lastSeen;
+            row[COL.PURCHASE]    = asset.purchase;
+            row[COL.WARRANTY]    = asset.warranty;
+            row[COL.TENANT_ID]   = asset.tenantId;
+            row[COL.LANSWEEPER]  = asset.lansweeper;
             row[COL.SYNC_STATUS] = "JIRA";
             row[COL.LAST_SYNC]   = now;
             await appendRow(context, sheet, row);
@@ -604,6 +683,10 @@ async function matchLocalAssets() {
           const cur = range.values[0];
           cur[COL.ASSET_ID]    = asset.id;
           cur[COL.ASSET_KEY]   = asset.key;
+          cur[COL.HOSTNAME]    = asset.hostname;
+          cur[COL.STATUS]      = asset.status;
+          cur[COL.LOCATION]    = asset.location;
+          cur[COL.MODEL]       = asset.model;
           cur[COL.SYNC_STATUS] = "JIRA";
           cur[COL.VALIDATION]  = "OK";
           cur[COL.LAST_SYNC]   = new Date().toISOString();
@@ -775,8 +858,8 @@ async function createTickets() {
           if (row[COL.ACTION] !== "Create Ticket") continue;
           if (row[COL.CASE_JIRA]) { skipped++; continue; } // already has ticket
 
-          const deviceName = row[COL.DEVICE_NAME] || row[COL.ASSET_KEY] || "Unknown";
-          const email      = row[COL.USER_EMAIL]  || "";
+          const deviceName = row[COL.HOSTNAME] || row[COL.ASSET_KEY] || "Unknown";
+          const email      = row[COL.ASSIGNED] || row[COL.USERNAME] || "";
           const serial     = row[COL.SERIAL]      || "";
           const note       = row[COL.NOTE]        || "";
           const rowDays    = row[COL.DAYS]        || days;
