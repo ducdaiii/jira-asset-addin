@@ -261,10 +261,10 @@ async function assetsPost(path, body) {
 async function fetchJiraAssets() {
   const assets = [];
   let startAt = 0;
-  const pageSize = 25; // Jira Assets API thường giới hạn 25/page
-  let total = Infinity;
+  const pageSize = 25; // Jira Assets API giới hạn 25/page
+  let total = null;    // null = chưa biết, lấy từ response đầu tiên
 
-  while (startAt < total) {
+  while (true) {
     const data = await assetsPost("/object/aql", {
       qlQuery:           cfg.aqlQuery || "objectTypeId IN (525,527,529)",
       startAt:           startAt,
@@ -272,12 +272,21 @@ async function fetchJiraAssets() {
       includeAttributes: true,
     });
 
-    // Lấy total từ response để biết còn bao nhiêu trang
-    total = data.total ?? data.totalObjects ?? (data.values?.length ?? 0);
-    if (total === 0) break;
-
     const values = data.values || [];
-    if (values.length === 0) break; // không còn data
+
+    // Lấy total lần đầu từ response
+    if (total === null) {
+      total = typeof data.total === "number"        ? data.total
+            : typeof data.totalObjects === "number" ? data.totalObjects
+            : null;
+    }
+
+    // Không còn data → dừng
+    if (values.length === 0) break;
+
+    // Log progress mỗi trang
+    const totalLabel = total !== null ? total : "?";
+    console.log(`fetchJiraAssets: page startAt=${startAt}, got ${values.length}, total=${totalLabel}`);
 
     values.forEach(obj => {
       // Lookup by attribute ID (ổn định hơn tên)
@@ -317,8 +326,13 @@ async function fetchJiraAssets() {
     });
 
     startAt += values.length;
-    if (values.length < pageSize || startAt >= (data.total || 0)) break;
+
+    // Dừng khi đã lấy đủ total hoặc page không đầy (trang cuối)
+    if (total !== null && startAt >= total) break;
+    if (values.length < pageSize) break;
   }
+
+  console.log(`fetchJiraAssets: loaded ${assets.length} assets (total reported: ${total})`);
   return assets;
 }
 
