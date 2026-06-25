@@ -313,22 +313,32 @@ function parseAsset(obj) {
   };
 }
 
-// Fetch toàn bộ records của 1 AQL query (giả định totalCount < 1000)
-// Dùng pagination thông thường: startAt 0→25→50→...
+// Fetch toàn bộ records của 1 AQL query
+// Dùng total từ response page đầu làm hard stop — không phụ thuộc vào values.length
 async function fetchAllUnderLimit(qlQuery) {
   const assets   = [];
   const pageSize = 25;
-  let startAt    = 0;
 
-  while (true) {
+  // Page đầu: lấy total thực tế từ API
+  const firstPage = await fetchPage(qlQuery, 0, pageSize);
+  const total     = typeof firstPage.total === "number" ? firstPage.total : 0;
+  const firstVals = firstPage.values || [];
+
+  if (total === 0 || firstVals.length === 0) return assets;
+  firstVals.forEach(obj => assets.push(parseAsset(obj)));
+  console.log(`  [fetchAllUnderLimit] ${qlQuery}: total=${total}, loaded=${assets.length}`);
+
+  // Tiếp tục cho đến khi đủ total
+  let startAt = firstVals.length;
+  while (assets.length < total) {
     const data   = await fetchPage(qlQuery, startAt, pageSize);
     const values = data.values || [];
     if (values.length === 0) break;
     values.forEach(obj => assets.push(parseAsset(obj)));
     startAt += values.length;
-    console.log(`  [fetchAllUnderLimit] ${qlQuery}: loaded=${assets.length}`);
-    if (values.length < pageSize) break;
+    console.log(`  [fetchAllUnderLimit] ${qlQuery}: loaded=${assets.length}/${total}`);
   }
+
   return assets;
 }
 
