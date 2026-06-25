@@ -46,7 +46,7 @@ const COL_COUNT = 32;
 const HEADERS = [
   "Asset ID","Asset Key","Hostname","Serial Number",
   "Status","Location","Region","Manufacturer","Model",
-  "Operating System","Version OS","Windows Build","CPU",
+  "Operating System","Windows Version","Windows Build","CPU",
   "IP Address","MAC Address","Network Name","Antivirus",
   "Username","Assigned User","First Seen","Last Seen",
   "Purchase Date","Warranty Expire","Tenant ID / Source ID","Lansweeper URL",
@@ -349,7 +349,7 @@ async function fetchAllUnderLimit(qlQuery) {
 // sub-query từng version — mỗi sub-query sẽ < 1000.
 //
 // Attr ID cho OS Version: 27291
-// Tên attribute trong AQL: "Windows Version"  (displayName)
+// Tên attribute trong AQL: "Version OS"  (displayName trong Jira Assets schema)
 // ══════════════════════════════════════════════════════════════
 async function fetchOsVersions(typeId) {
   // Lấy tối đa 1000 records (limit API) để collect unique OS version values
@@ -484,10 +484,10 @@ async function fetchByOsBuild(typeId, osVersion, parentQuery) {
   for (const build of builds) {
     let subQuery;
     if (build === "") {
-      subQuery = `${parentQuery} AND "Windows Build" is EMPTY`;
+      subQuery = `${parentQuery} AND "OS Build" is EMPTY`;
     } else {
       const escaped = build.replace(/"/g, '\\"');
-      subQuery = `${parentQuery} AND "Windows Build" = "${escaped}"`;
+      subQuery = `${parentQuery} AND "OS Build" = "${escaped}"`;
     }
     console.log(`    [fetchByOsBuild] sub-query: ${subQuery}`);
     const subAssets = await fetchAllUnderLimit(subQuery);
