@@ -854,12 +854,13 @@ async function runSync() {
         status: i < typeIds.length - 1 ? "running" : "done",
       }));
       updateSyncPanel(syncPanel, uiState);
+    }
 
-      // Ghi vào Excel sau mỗi typeId
-      for (const sheetName of sheetNames) {
-        const sheetAssets = Array.from(locationMap[sheetName].values());
-        await writeLocationSheet(sheetName, sheetAssets, now);
-      }
+    // Ghi vào Excel SAU KHI đã gom đủ tất cả typeId
+    toast("Đang ghi vào Excel...", "warning");
+    for (const [sheetName, assetMap] of Object.entries(locationMap)) {
+      const sheetAssets = Array.from(assetMap.values());
+      await writeLocationSheet(sheetName, sheetAssets, now);
     }
 
     // Push LOCAL rows lên Jira
