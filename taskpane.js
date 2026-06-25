@@ -305,22 +305,52 @@ function parseAsset(obj) {
 }
 
 // ── Fetch tất cả assets của 1 AQL query ───────────────────────
-// API không luôn trả total → dùng "page không đầy = trang cuối"
+// Logic pagination theo field "total" từ API:
+//   - total < 1000 → chạy đủ 1 batch (startAt..startAt+total), dừng
+//   - total = 1000 → có thể còn data → chạy tiếp batch kế (startAt += 1000)
+//   - total = 0    → hết data → dừng
 async function fetchByQuery(qlQuery) {
   const assets = [];
-  let startAt = 0;
-  const pageSize = 25;
+  const batchSize = 1000; // mỗi batch tối đa 1000
+  const pageSize  = 25;   // mỗi page 25 record
+  let batchStart  = 0;    // startAt của batch hiện tại
 
   while (true) {
-    const data = await fetchPage(qlQuery, startAt, pageSize);
-    const values = data.values || [];
+    // Fetch từng page trong batch
+    let pageStart = batchStart;
+    let batchTotal = null;
 
-    if (values.length === 0) break;                 // trang rỗng → dừng
-    values.forEach(obj => assets.push(parseAsset(obj)));
-    startAt += values.length;
-    console.log(`  [typeId query] loaded ${startAt} so far...`);
-    if (values.length < pageSize) break;            // trang không đầy = trang cuối
+    while (true) {
+      const data   = await fetchPage(qlQuery, pageStart, pageSize);
+      const values = data.values || [];
+      const total  = typeof data.total === "number" ? data.total : 0;
+
+      // Lấy total của batch từ page đầu tiên
+      if (batchTotal === null) batchTotal = total;
+
+      if (values.length === 0) break;
+      values.forEach(obj => assets.push(parseAsset(obj)));
+      pageStart += values.length;
+
+      console.log(`  [${qlQuery}] loaded ${assets.length}, page startAt=${pageStart}, batchTotal=${batchTotal}`);
+
+      // Hết batch này (đã load đủ total records của batch)
+      if (pageStart >= batchStart + (batchTotal || 0)) break;
+      if (values.length < pageSize) break;
+    }
+
+    // Quyết định có chạy batch tiếp không
+    if (batchTotal === null || batchTotal < batchSize) {
+      // total < 1000 → đã lấy hết, dừng
+      break;
+    }
+
+    // total = 1000 → chạy batch tiếp
+    batchStart += batchSize;
+    console.log(`  [${qlQuery}] total=${batchTotal} = 1000, loading next batch from ${batchStart}...`);
   }
+
+  console.log(`  [${qlQuery}] done: ${assets.length} assets`);
   return assets;
 }
 
