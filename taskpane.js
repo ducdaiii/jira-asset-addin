@@ -46,7 +46,7 @@ const COL_COUNT = 32;
 const HEADERS = [
   "Asset ID","Asset Key","Hostname","Serial Number",
   "Status","Location","Region","Manufacturer","Model",
-  "Operating System","Windows Version","Windows Build","CPU",
+  "Operating System","Version OS","Windows Build","CPU",
   "IP Address","MAC Address","Network Name","Antivirus",
   "Username","Assigned User","First Seen","Last Seen",
   "Purchase Date","Warranty Expire","Tenant ID / Source ID","Lansweeper URL",
@@ -414,11 +414,11 @@ async function fetchByTypeId(typeId) {
     let subQuery;
     if (ver === "") {
       // Records không có giá trị OS Version
-      subQuery = `objectTypeId = ${typeId} AND "Windows Version" is EMPTY`;
+      subQuery = `objectTypeId = ${typeId} AND "Version OS" is EMPTY`;
     } else {
       // Escape dấu nháy kép bên trong value nếu có
       const escaped = ver.replace(/"/g, '\\"');
-      subQuery = `objectTypeId = ${typeId} AND "Windows Version" = "${escaped}"`;
+      subQuery = `objectTypeId = ${typeId} AND "Version OS" = "${escaped}"`;
     }
 
     toast(`  [${i + 1}/${versions.length}] Fetching: ${ver || "(blank)"}...`, "warning");
