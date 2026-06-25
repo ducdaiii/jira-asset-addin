@@ -403,7 +403,7 @@ function _legacyParseBlock(obj) {
 // SHEET HELPERS
 // ══════════════════════════════════════════════════════════════
 function locationSheetName(loc) {
-  return "LOC_" + loc.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase();
+  return "_" + loc.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase();
 }
 
 async function ensureSheet(context, name) {
@@ -464,7 +464,7 @@ async function getLocationSheets(context) {
   context.workbook.worksheets.load("items/name");
   await context.sync();
   return context.workbook.worksheets.items
-    .filter(s => s.name.startsWith("LOC_"))
+    .filter(s => s.name.startsWith("_"))
     .map(s => s.name);
 }
 
@@ -708,7 +708,7 @@ async function runSync() {
       // Ghi ngay vào Excel sau mỗi typeId — không chờ load hết
       const sheetNames = Object.keys(locationMap);
       const uiState = sheetNames.map(s => ({
-        name: s.replace("LOC_", ""),
+        name: s.replace("_", ""),
         done: locationMap[s].size,
         total: locationMap[s].size,
         status: i < typeIds.length - 1 ? "running" : "done",
