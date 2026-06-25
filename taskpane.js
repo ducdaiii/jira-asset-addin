@@ -257,83 +257,132 @@ async function assetsPost(path, body) {
   return res.json();
 }
 
-// ── Fetch ALL assets via AQL pagination (lấy hết, không giới hạn) ──
-async function fetchJiraAssets() {
+// ── Fetch 1 page từ Jira Assets API ──────────────────────────
+async function fetchPage(qlQuery, startAt, pageSize) {
+  return assetsPost("/object/aql", {
+    qlQuery,
+    startAt,
+    maxResults:        pageSize,
+    includeAttributes: true,
+  });
+}
+
+// ── Parse 1 object thành asset record ─────────────────────────
+function parseAsset(obj) {
+  const attrById = (id) => {
+    const a = (obj.attributes || []).find(
+      x => String(x.objectTypeAttributeId) === String(id)
+    );
+    return a?.objectAttributeValues?.[0]?.displayValue || "";
+  };
+  return {
+    id:          String(obj.id || ""),
+    key:         obj.objectKey || "",
+    hostname:    attrById(1737) || obj.label || "",
+    serial:      attrById(5194),
+    status:      attrById(5052),
+    location:    attrById(30125),
+    region:      attrById(27292),
+    manufacturer:attrById(6608),
+    model:       attrById(6609),
+    os:          attrById(30345),
+    osVersion:   attrById(27291),
+    osBuild:     attrById(27290),
+    cpu:         attrById(6610),
+    ip:          attrById(5208),
+    mac:         attrById(5209),
+    network:     attrById(5210),
+    antivirus:   attrById(6612),
+    username:    attrById(5200),
+    assigned:    attrById(26690),
+    firstSeen:   attrById(5205),
+    lastSeen:    attrById(5206),
+    purchase:    attrById(5203),
+    warranty:    attrById(6615),
+    tenantId:    attrById(26398),
+    lansweeper:  attrById(5207),
+  };
+}
+
+// ── Fetch tất cả assets của 1 AQL query (tối đa 1000/query) ───
+async function fetchByQuery(qlQuery) {
   const assets = [];
   let startAt = 0;
-  const pageSize = 25; // Jira Assets API giới hạn 25/page
-  let total = null;    // null = chưa biết, lấy từ response đầu tiên
+  const pageSize = 25;
+  let total = null;
 
   while (true) {
-    const data = await assetsPost("/object/aql", {
-      qlQuery:           cfg.aqlQuery || "objectTypeId IN (525,527,529)",
-      startAt:           startAt,
-      maxResults:        pageSize,
-      includeAttributes: true,
-    });
-
+    const data = await fetchPage(qlQuery, startAt, pageSize);
     const values = data.values || [];
 
-    // Lấy total lần đầu từ response
     if (total === null) {
       total = typeof data.total === "number"        ? data.total
             : typeof data.totalObjects === "number" ? data.totalObjects
             : null;
     }
 
-    // Không còn data → dừng
     if (values.length === 0) break;
-
-    // Log progress mỗi trang
-    const totalLabel = total !== null ? total : "?";
-    console.log(`fetchJiraAssets: page startAt=${startAt}, got ${values.length}, total=${totalLabel}`);
-
-    values.forEach(obj => {
-      // Lookup by attribute ID (ổn định hơn tên)
-      const attrById = (id) => {
-        const a = (obj.attributes || []).find(
-          x => String(x.objectTypeAttributeId) === String(id)
-        );
-        return a?.objectAttributeValues?.[0]?.displayValue || "";
-      };
-      assets.push({
-        id:          String(obj.id || ""),
-        key:         obj.objectKey || "",
-        hostname:    attrById(1737) || obj.label || "",
-        serial:      attrById(5194),
-        status:      attrById(5052),
-        location:    attrById(30125),
-        region:      attrById(27292),
-        manufacturer:attrById(6608),
-        model:       attrById(6609),
-        os:          attrById(30345),
-        osVersion:   attrById(27291),
-        osBuild:     attrById(27290),
-        cpu:         attrById(6610),
-        ip:          attrById(5208),
-        mac:         attrById(5209),
-        network:     attrById(5210),
-        antivirus:   attrById(6612),
-        username:    attrById(5200),
-        assigned:    attrById(26690),
-        firstSeen:   attrById(5205),
-        lastSeen:    attrById(5206),
-        purchase:    attrById(5203),
-        warranty:    attrById(6615),
-        tenantId:    attrById(26398),
-        lansweeper:  attrById(5207),
-      });
-    });
+    values.forEach(obj => assets.push(parseAsset(obj)));
 
     startAt += values.length;
+    console.log(`  [${qlQuery.slice(0,40)}] startAt=${startAt}/${total ?? "?"}`);
 
-    // Dừng khi đã lấy đủ total hoặc page không đầy (trang cuối)
     if (total !== null && startAt >= total) break;
     if (values.length < pageSize) break;
   }
+  return { assets, total };
+}
 
-  console.log(`fetchJiraAssets: loaded ${assets.length} assets (total reported: ${total})`);
-  return assets;
+// ── Fetch ALL assets — chia nhỏ theo từng objectTypeId ─────────
+// Jira Assets API hard limit: 1000 records per query
+// Giải pháp: tách AQL "objectTypeId IN (A,B,C)" thành query riêng
+// từng typeId → mỗi query tối đa 1000, gộp lại không giới hạn
+async function fetchJiraAssets() {
+  const aqlRaw = (cfg.aqlQuery || "objectTypeId IN (525,527,529)").trim();
+
+  // Parse objectTypeId list từ AQL config
+  const typeIdMatch = aqlRaw.match(/objectTypeId\s+IN\s*\(([^)]+)\)/i);
+  let typeIds = [];
+  if (typeIdMatch) {
+    typeIds = typeIdMatch[1].split(",").map(s => s.trim()).filter(Boolean);
+  }
+
+  let allAssets = [];
+
+  if (typeIds.length <= 1) {
+    // Query đơn — fetch bình thường
+    const { assets, total } = await fetchByQuery(aqlRaw);
+    allAssets = assets;
+    console.log(`fetchJiraAssets: single query, loaded ${allAssets.length} (total=${total})`);
+  } else {
+    // Chia thành từng query riêng theo typeId
+    console.log(`fetchJiraAssets: splitting into ${typeIds.length} queries to bypass 1000 limit`);
+    const seenIds = new Set(); // chống trùng nếu asset thuộc nhiều type
+
+    for (const typeId of typeIds) {
+      const singleQuery = `objectTypeId = ${typeId}`;
+      toast(`Đang tải objectTypeId=${typeId}...`, "warning");
+      const { assets, total } = await fetchByQuery(singleQuery);
+
+      let added = 0;
+      assets.forEach(a => {
+        if (!seenIds.has(a.id)) {
+          seenIds.add(a.id);
+          allAssets.push(a);
+          added++;
+        }
+      });
+      console.log(`  typeId=${typeId}: got ${assets.length} (total=${total}), added=${added}`);
+    }
+    console.log(`fetchJiraAssets: total loaded ${allAssets.length} across ${typeIds.length} types`);
+  }
+
+  return allAssets;
+}
+
+// (legacy parse block — replaced by parseAsset above, kept for ref)
+function _legacyParseBlock(obj) {
+      // Lookup by attribute ID (ổn định hơn tên)
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -580,55 +629,84 @@ async function runSync() {
           if (ser) bySerial[ser] = idx;
         });
 
-        // ── Phân loại: UPDATE vs INSERT ──
-        const toUpdate = []; // { rowIdx, newRow }
-        const toInsert = []; // row arrays
 
+
+        // ══════════════════════════════════════════════
+        // SYNC STRATEGY:
+        //   JIRA asset có trong sheet  → UPDATE tại chỗ
+        //   JIRA asset chưa có         → INSERT dòng mới cuối sheet
+        //   Sheet row không còn Jira   → GIỮ NGUYÊN, Validation = "Not in Jira"
+        // ══════════════════════════════════════════════
+
+        // Build set Asset ID nào Jira đang có (cho sheet này)
+        const jiraIdSet = new Set(assets.map(a => a.id).filter(Boolean));
+
+        // ── Bước A: UPDATE các dòng đã có trong sheet ──
+        const updatedIdxs = new Set();
         assets.forEach(asset => {
           const existingIdx =
-            byId[asset.id] !== undefined                            ? byId[asset.id] :
-            asset.serial && bySerial[asset.serial] !== undefined   ? bySerial[asset.serial] :
+            byId[asset.id] !== undefined                         ? byId[asset.id] :
+            asset.serial && bySerial[asset.serial] !== undefined ? bySerial[asset.serial] :
             -1;
 
           if (existingIdx >= 0) {
-            toUpdate.push({
-              rowIdx: existingIdx,
-              newRow: assetToRow(asset, loc, now, existing[existingIdx])
-            });
-          } else {
-            toInsert.push(assetToRow(asset, loc, now, null));
+            const newRow = assetToRow(asset, loc, now, existing[existingIdx]);
+            // Clear "Not in Jira" nếu asset quay lại
+            if (newRow[COL.VALIDATION] === "Not in Jira") newRow[COL.VALIDATION] = "";
+            const range = sheet.getRangeByIndexes(existingIdx + 1, 0, 1, COL_COUNT);
+            range.values = [newRow];
+            updatedIdxs.add(existingIdx);
           }
         });
 
-        // ── BATCH UPDATE: ghi tất cả updates cùng lúc, không await từng cái ──
-        toUpdate.forEach(({ rowIdx, newRow }) => {
-          const range = sheet.getRangeByIndexes(rowIdx + 1, 0, 1, COL_COUNT);
-          range.values = [newRow];
-          // Không await ở đây — queue hết rồi sync 1 lần
+        // ── Bước B: Mark rows không còn trong Jira → Validation = "Not in Jira" ──
+        existing.forEach((row, idx) => {
+          if (updatedIdxs.has(idx)) return;                    // đã update
+          if (row[COL.SYNC_STATUS] === "LOCAL") return;        // LOCAL row — bỏ qua
+          const assetId = String(row[COL.ASSET_ID] || "").trim();
+          if (!assetId) return;                                // không có ID — bỏ qua
+          if (!jiraIdSet.has(assetId)) {
+            // Asset này không còn trong Jira response
+            const valCell = sheet.getRangeByIndexes(idx + 1, COL.VALIDATION, 1, 1);
+            valCell.values = [["Not in Jira"]];
+            valCell.format.font.color = "#f59e0b"; // màu vàng cảnh báo
+          }
         });
 
-        // ── BATCH INSERT: ghi tất cả rows mới 1 lần ──
+        // ── Bước C: INSERT các asset mới chưa có trong sheet ──
+        const toInsert = assets.filter(asset => {
+          const byIdMatch     = byId[asset.id] !== undefined;
+          const bySerialMatch = asset.serial && bySerial[asset.serial] !== undefined;
+          return !byIdMatch && !bySerialMatch;
+        });
+
         if (toInsert.length > 0) {
           const used = sheet.getUsedRangeOrNullObject(true);
-          await context.sync(); // sync 1 lần để biết rowCount
+          await context.sync(); // cần biết rowCount hiện tại
           let startRow = 1;
           if (!used.isNullObject) {
             used.load("rowCount");
             await context.sync();
             startRow = used.rowCount;
           }
-          // Ghi toàn bộ rows mới 1 lần duy nhất
-          const insertRange = sheet.getRangeByIndexes(startRow, 0, toInsert.length, COL_COUNT);
-          insertRange.values = toInsert;
+          const newRows = toInsert.map(a => assetToRow(a, loc, now, null));
+          const insertRange = sheet.getRangeByIndexes(startRow, 0, newRows.length, COL_COUNT);
+          insertRange.values = newRows;
         }
 
-        // ── 1 context.sync() duy nhất để flush mọi thay đổi ──
+        // ── 1 context.sync() flush toàn bộ ──
         await context.sync();
+
+        const notInJira = existing.filter((row, idx) => {
+          if (updatedIdxs.has(idx) || row[COL.SYNC_STATUS] === "LOCAL") return false;
+          const id = String(row[COL.ASSET_ID] || "").trim();
+          return id && !jiraIdSet.has(id);
+        }).length;
 
         syncState[li].done   = assets.length;
         syncState[li].status = "done";
         updateSyncPanel(syncPanel, syncState);
-        console.log(`Sheet ${sheetName}: updated=${toUpdate.length}, inserted=${toInsert.length}`);
+        console.log(`Sheet ${sheetName}: updated=${updatedIdxs.size}, inserted=${toInsert.length}, notInJira=${notInJira}`);
       });
     }
 
