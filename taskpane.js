@@ -315,8 +315,7 @@ async function fetchSafe(qlQuery) {
     const data   = await fetchPage(qlQuery, startAt, PAGE);
     const values = data.values || [];
     if (values.length === 0) break;
-    const remaining = Math.max(total - assets.length, 0);
-    values.slice(0, remaining).forEach(o => assets.push(parseAsset(o)));
+    values.forEach(o => assets.push(parseAsset(o)));
     startAt += values.length;
     console.log(`  [fetchSafe] loaded=${assets.length}/${total}`);
   }
@@ -639,7 +638,7 @@ function applyJiraData(existingRow, asset, now) {
 //   - Ưu tiên theo Asset ID (byId)
 //   - Fallback theo Serial (bySerial)
 // ══════════════════════════════════════════════════════════════
-async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
+async function writeLocationSheet(sheetName, assets, now) {
   await Excel.run(async (context) => {
     const sheet = await ensureSheet(context, sheetName);
     await ensureHeaders(context, sheet);
@@ -657,12 +656,9 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
       if (ser) bySerial[ser] = idx;
     });
 
-    // Chỉ được mark "Not in Jira" sau khi đã fetch xong TOÀN BỘ Jira assets.
-    // allKnownIds = Set chứa tất cả Jira Asset IDs của mọi typeId / version trong lần sync này.
-    // Nếu chưa truyền allKnownIds, writeLocationSheet chỉ UPDATE/INSERT, tuyệt đối không MARK.
-    const shouldMarkNotInJira = allKnownIds instanceof Set;
-    const jiraIds             = shouldMarkNotInJira ? allKnownIds : new Set();
-    const updatedIdx          = new Set();
+    // Set chứa Jira IDs để detect "Not in Jira"
+    const jiraIds    = new Set(assets.map(a => a.id).filter(Boolean));
+    const updatedIdx = new Set();
 
     // ── A: UPDATE existing rows ───────────────────────────────
     // Ghi toàn bộ COL_COUNT cells (dữ liệu Jira) + giữ user cols
@@ -688,25 +684,21 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
     if (updateRows.length > 0) await context.sync();
 
     // ── B: MARK "Not in Jira" ─────────────────────────────────
-    // Quan trọng: chỉ mark khi runSync đã fetch xong toàn bộ typeId/version
-    // và truyền allKnownIds vào đây. Không mark trong sub-batch.
     const markRows = [];
-    if (shouldMarkNotInJira) {
-      existing.forEach((row, idx) => {
-        if (updatedIdx.has(idx))                              return;
-        if (String(row[COL.SYNC_STATUS] || "") === "LOCAL")  return;
-        const id = String(row[COL.ASSET_ID] || "").trim();
-        if (!id || jiraIds.has(id))                          return;
-        markRows.push(idx + 1);
-      });
+    existing.forEach((row, idx) => {
+      if (updatedIdx.has(idx))                              return;
+      if (String(row[COL.SYNC_STATUS] || "") === "LOCAL")  return;
+      const id = String(row[COL.ASSET_ID] || "").trim();
+      if (!id || jiraIds.has(id))                          return;
+      markRows.push(idx + 1);
+    });
 
-      for (const excelRow of markRows) {
-        const cell = sheet.getRangeByIndexes(excelRow, COL.VALIDATION, 1, 1);
-        cell.values = [["Not in Jira"]];
-        cell.format.font.color = "#f59e0b";
-      }
-      if (markRows.length > 0) await context.sync();
+    for (const excelRow of markRows) {
+      const cell = sheet.getRangeByIndexes(excelRow, COL.VALIDATION, 1, 1);
+      cell.values = [["Not in Jira"]];
+      cell.format.font.color = "#f59e0b";
     }
+    if (markRows.length > 0) await context.sync();
 
     // ── C: INSERT new rows ────────────────────────────────────
     const toInsert = assets.filter(a => {
@@ -822,68 +814,45 @@ async function runSync() {
     if (!typeIds.length) { toast("AQL Query chưa đúng", "error"); return; }
 
     const now = new Date().toISOString();
-
-    // 1. Fetch hết toàn bộ typeId trước, chưa ghi sheet và chưa mark.
-    //    Đây là phần fix chính: không để batch 23H2/24H2/typeId riêng lẻ tự mark nhau là "Not in Jira".
-    const globalSeen = new Map();  // assetKey/id → asset
+    let totalFetched = 0;
 
     for (let i = 0; i < typeIds.length; i++) {
       const typeId = typeIds[i];
-      toast(`[${i+1}/${typeIds.length}] Đang tải typeId=${typeId}...`, "warning");
+      toast(`[${i+1}/${typeIds.length}] Đang xử lý typeId=${typeId}...`, "warning");
 
+      // 1. Fetch toàn bộ assets của typeId này
       const assets = await fetchByTypeId(typeId);
+      totalFetched += assets.length;
 
+      // 2. Group theo location
+      const byLocation = {};   // sheetName → asset[]
       assets.forEach(a => {
-        const k = a.key || a.id;
-        if (!k) return;
-        if (!globalSeen.has(k)) globalSeen.set(k, a);
+        const sheetName = locationSheetName((a.location || "UNKNOWN").trim());
+        if (!byLocation[sheetName]) byLocation[sheetName] = [];
+        byLocation[sheetName].push(a);
       });
 
-      if (syncPanel) {
-        updateSyncPanel(syncPanel, [{
-          name: `FETCH_TYPE_${typeId}`,
-          count: assets.length,
-          status: i < typeIds.length - 1 ? "running" : "done",
-        }]);
+      // 3. Ghi từng location sheet
+      const sheetNames = Object.keys(byLocation);
+      toast(`typeId=${typeId}: ghi ${sheetNames.length} sheet(s)...`, "warning");
+
+      for (const sheetName of sheetNames) {
+        await writeLocationSheet(sheetName, byLocation[sheetName], now);
       }
 
-      console.log(`typeId=${typeId}: fetched=${assets.length}, global=${globalSeen.size}`);
+      // 4. Update UI panel
+      if (syncPanel) {
+        updateSyncPanel(syncPanel, sheetNames.map(s => ({
+          name:   s.replace(/^_/, ""),
+          count:  byLocation[s].length,
+          status: i < typeIds.length - 1 ? "running" : "done",
+        })));
+      }
+
+      console.log(`typeId=${typeId}: ${assets.length} assets → ${sheetNames.length} sheet(s)`);
     }
 
-    const allAssets   = [...globalSeen.values()];
-    const allKnownIds = new Set(allAssets.map(a => String(a.id || "").trim()).filter(Boolean));
-
-    // 2. Sau khi đã có đủ allKnownIds, mới group theo location để ghi sheet.
-    const byLocation = {};   // sheetName → asset[]
-    allAssets.forEach(a => {
-      const sheetName = locationSheetName((a.location || "UNKNOWN").trim());
-      if (!byLocation[sheetName]) byLocation[sheetName] = [];
-      byLocation[sheetName].push(a);
-    });
-
-    // 3. Ghi tất cả sheet có assets mới + các sheet location cũ.
-    //    Sheet cũ không còn asset nào cũng cần được quét để mark đúng.
-    let allSheetNames = Object.keys(byLocation);
-    await Excel.run(async (context) => {
-      const existingLocationSheets = await getLocationSheets(context);
-      allSheetNames = [...new Set([...allSheetNames, ...existingLocationSheets])];
-    });
-
-    toast(`Đang ghi ${allSheetNames.length} location sheet(s)...`, "warning");
-
-    for (const sheetName of allSheetNames) {
-      await writeLocationSheet(sheetName, byLocation[sheetName] || [], now, allKnownIds);
-    }
-
-    if (syncPanel) {
-      updateSyncPanel(syncPanel, allSheetNames.map(s => ({
-        name:   s.replace(/^_/, ""),
-        count:  (byLocation[s] || []).length,
-        status: "done",
-      })));
-    }
-
-    // 4. Push LOCAL rows lên Jira
+    // 5. Push LOCAL rows lên Jira
     toast("Đang push LOCAL assets lên Jira...", "warning");
     await pushLocalAssets();
 
@@ -893,7 +862,7 @@ async function runSync() {
 
     setSyncIndicator("ok", "Synced");
     setInner("last-sync-time", formatTime(cfg.lastSync));
-    toast(`Sync hoàn tất — ${allAssets.length} assets`, "success");
+    toast(`Sync hoàn tất — ${totalFetched} assets`, "success");
     await refreshDashboard();
 
   } catch(e) {
