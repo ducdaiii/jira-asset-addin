@@ -245,6 +245,19 @@ async function assetsPut(path, body) {
   return res.json().catch(() => ({}));
 }
 
+async function assetsDelete(path) {
+  const res = await fetch(proxyUrl(`${assetsBase()}${path}`), {
+    method: "DELETE",
+    headers: jiraHeaders(),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Assets DELETE ${res.status}: ${(await res.text().catch(() => "")).slice(0,200)}`);
+  }
+
+  return true;
+}
+
 // ══════════════════════════════════════════════════════════════
 // FETCH LAYER
 // ══════════════════════════════════════════════════════════════
@@ -1013,9 +1026,9 @@ async function runSync() {
       })));
     }
 
-    toast("Đang push LOCAL assets lên Jira...", "warning");
-    await pushLocalAssets();
-
+    // Không tự động tạo LOCAL asset khi Full Sync.
+    // Tạo mới chỉ được thực hiện thủ công bằng Action = "+"
+    // và chỉ khi SYNC_STATUS = LOCAL + Asset ID trống.
     cfg.lastSync = new Date().toISOString();
     Office.context.document.settings.set(CFG_KEYS.LAST_SYNC, cfg.lastSync);
     Office.context.document.settings.saveAsync();
@@ -1121,32 +1134,38 @@ async function pushLocalAssets() {
 // UPDATE / CREATE JIRA ASSET FROM EXCEL ACTION COLUMN
 //
 // Action rules:
-//   x = nếu có Asset ID thì UPDATE Jira, nếu chưa có Asset ID thì CREATE mới
-//   o = xóa row khỏi Excel sheet (không xóa object trên Jira để tránh mất dữ liệu)
+//   x = UPDATE Jira asset hiện có, bắt buộc có Asset ID
+//   + = CREATE mới Jira asset, chỉ khi SYNC_STATUS = LOCAL và Asset ID trống
+//   o = xóa object trên Jira nếu có Asset ID, sau đó xóa row khỏi Excel sheet
+//
+// Create/Update fields gửi lên Jira:
+//   Hostname, Serial, Location, Status, Purchase Date
 // ══════════════════════════════════════════════════════════════
+function normalizeAction(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isLocalRow(row) {
+  return String(row[COL.SYNC_STATUS] || "").trim().toUpperCase() === "LOCAL";
+}
+
 function rowToJiraFields(row) {
   return {
-    hostname:  String(row[COL.HOSTNAME]   || "").trim(),
-    serial:    String(row[COL.SERIAL]     || "").trim(),
-    location:  String(row[COL.LOCATION]   || "").trim(),
-    username:  String(row[COL.USERNAME]   || "").trim(),
-    status:    String(row[COL.STATUS]     || "").trim(),
-    region:    String(row[COL.REGION]     || "").trim(),
-    osVersion: String(row[COL.OS_VERSION] || "").trim(),
-    osBuild:   String(row[COL.OS_BUILD]   || "").trim(),
+    hostname: String(row[COL.HOSTNAME] || "").trim(),
+    serial:   String(row[COL.SERIAL]   || "").trim(),
+    location: String(row[COL.LOCATION] || "").trim(),
+    status:   String(row[COL.STATUS]   || "").trim(),
+    purchase: String(row[COL.PURCHASE] || "").trim(),
   };
 }
 
 function jiraAttributesFromFields(fields) {
   const attrMap = {
-    hostname:  1737,
-    serial:    5194,
-    location:  30125,
-    username:  5200,
-    status:    5052,
-    region:    27292,
-    osVersion: 27291,
-    osBuild:   27290,
+    hostname: 1737,
+    serial:   5194,
+    location: 30125,
+    status:   5052,
+    purchase: 5203,
   };
 
   return Object.entries(fields)
@@ -1158,19 +1177,36 @@ function jiraAttributesFromFields(fields) {
 }
 
 async function updateJiraAsset(assetId, fields) {
+  const id = String(assetId || "").trim();
+  if (!id) throw new Error("Action x cần có Asset ID để update");
+
   const attributes = jiraAttributesFromFields(fields);
-  if (!assetId) throw new Error("Missing Asset ID");
   if (!attributes.length) throw new Error("Không có field nào để update");
 
-  // Jira Assets update object dùng PUT /object/{id}
-  return assetsPut(`/object/${assetId}`, { attributes });
+  return assetsPut(`/object/${id}`, { attributes });
 }
 
 async function createJiraAssetFromRow(row) {
+  const assetId = String(row[COL.ASSET_ID] || "").trim();
+
+  if (assetId) {
+    throw new Error("Action + chỉ dùng cho row chưa có Asset ID");
+  }
+
+  if (!isLocalRow(row)) {
+    throw new Error('Action + chỉ tạo mới khi Sync Status = "LOCAL"');
+  }
+
   const typeIds = parseTypeIds();
-  if (!typeIds.length) throw new Error("Không tìm thấy objectTypeId trong AQL Query");
+  if (!typeIds.length) {
+    throw new Error("Không tìm thấy objectTypeId trong AQL Query");
+  }
 
   const defaultTypeId = Number(typeIds[0]);
+  if (!defaultTypeId) {
+    throw new Error("objectTypeId không hợp lệ");
+  }
+
   const fields = rowToJiraFields(row);
 
   if (!fields.hostname && !fields.serial) {
@@ -1178,12 +1214,21 @@ async function createJiraAssetFromRow(row) {
   }
 
   const attributes = jiraAttributesFromFields(fields);
-  if (!attributes.length) throw new Error("Không có field nào để create");
+  if (!attributes.length) {
+    throw new Error("Không có field nào để create");
+  }
 
   return assetsPost("/object/create", {
     objectTypeId: defaultTypeId,
     attributes,
   });
+}
+
+async function deleteJiraAsset(assetId) {
+  const id = String(assetId || "").trim();
+  if (!id) throw new Error("Missing Asset ID để xóa Jira asset");
+
+  return assetsDelete(`/object/${id}`);
 }
 
 async function processActionRows() {
@@ -1192,7 +1237,7 @@ async function processActionRows() {
     return;
   }
 
-  toast('Đang xử lý Action: "x" = update/create, "o" = xóa row...', "warning");
+  toast('Đang xử lý Action: "x" = update, "+" = create LOCAL, "o" = xóa Jira + row...', "warning");
 
   let updated = 0;
   let created = 0;
@@ -1211,26 +1256,42 @@ async function processActionRows() {
 
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
-          const action = String(row[COL.ACTION] || "").trim().toLowerCase();
-          const excelRow = i + 1; // 0 là header, nên data row đầu tiên là index 1
+          const action = normalizeAction(row[COL.ACTION]);
+          const excelRow = i + 1; // 0 là header, data row đầu tiên là index 1
 
           if (!action) continue;
 
-          // o = xóa khỏi Excel sheet, không gọi API delete Jira
+          // o = xóa Jira asset trước nếu có Asset ID, sau đó xóa row khỏi Excel
           if (action === "o") {
-            rowsToDelete.push(excelRow);
-            continue;
-          }
+            const assetId = String(row[COL.ASSET_ID] || "").trim();
 
-          if (action !== "x") {
-            skipped++;
+            try {
+              if (assetId) {
+                await deleteJiraAsset(assetId);
+              }
+
+              rowsToDelete.push(excelRow);
+              deleted++;
+            } catch (e) {
+              failed++;
+              row[COL.VALIDATION] = "Delete failed: " + String(e.message || e).slice(0, 120);
+              sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT).values = [row];
+              await context.sync();
+              console.warn(`[processActionRows] delete ${sheetName} row ${i + 2}:`, e.message || e);
+            }
+
             continue;
           }
 
           const assetId = String(row[COL.ASSET_ID] || "").trim();
 
           try {
-            if (assetId) {
+            if (action === "x") {
+              // UPDATE chỉ cho asset đã có trên Jira
+              if (!assetId) {
+                throw new Error('Action x chỉ update row đã có Asset ID. Muốn tạo mới hãy nhập Action = "+"');
+              }
+
               await updateJiraAsset(assetId, rowToJiraFields(row));
 
               row[COL.SYNC_STATUS] = "JIRA";
@@ -1240,7 +1301,20 @@ async function processActionRows() {
 
               sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT).values = [row];
               updated++;
-            } else {
+              await context.sync();
+              continue;
+            }
+
+            if (action === "+") {
+              // CREATE chỉ khi LOCAL + chưa có Asset ID
+              if (assetId) {
+                throw new Error('Action + chỉ dùng để tạo mới row chưa có Asset ID');
+              }
+
+              if (!isLocalRow(row)) {
+                throw new Error('Action + chỉ tạo mới khi Sync Status = LOCAL');
+              }
+
               const res = await createJiraAssetFromRow(row);
 
               row[COL.ASSET_ID] = String(res?.id || res?.objectId || "");
@@ -1252,12 +1326,14 @@ async function processActionRows() {
 
               sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT).values = [row];
               created++;
+              await context.sync();
+              continue;
             }
 
-            await context.sync();
+            skipped++;
           } catch (e) {
             failed++;
-            row[COL.VALIDATION] = "Update failed: " + String(e.message || e).slice(0, 120);
+            row[COL.VALIDATION] = "Action failed: " + String(e.message || e).slice(0, 120);
             sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT).values = [row];
             await context.sync();
             console.warn(`[processActionRows] ${sheetName} row ${i + 2}:`, e.message || e);
@@ -1269,7 +1345,6 @@ async function processActionRows() {
         for (const excelRow of rowsToDelete) {
           sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT)
             .delete(Excel.DeleteShiftDirection.up);
-          deleted++;
         }
 
         if (rowsToDelete.length > 0) await context.sync();
