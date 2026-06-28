@@ -1,5 +1,6 @@
 /* ════════════════════════════════════════════════════════════
    Jira Asset Manager — Office Add-in
+   PATCH: auto-move rows to correct Location sheet on sync
    taskpane.js  v2.0  (clean rewrite — all bugs fixed)
 
    FIXES vs v1.3:
@@ -802,7 +803,7 @@ function applyJiraData(existingRow, asset, now) {
 //   - Ưu tiên theo Asset ID (byId)
 //   - Fallback theo Serial (bySerial)
 // ══════════════════════════════════════════════════════════════
-async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
+async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, allAssetById = null) {
   await Excel.run(async (context) => {
     const sheet = await ensureSheet(context, sheetName);
     await ensureHeaders(context, sheet);
@@ -850,6 +851,7 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
     if (updateRows.length > 0) await context.sync();
 
     const validationUpdates = [];
+    const rowsToDeleteBecauseMoved = [];
 
     if (canFinalMark) {
       existing.forEach((row, idx) => {
@@ -860,6 +862,22 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
         if (!id) return;
 
         const currentValidation = String(row[COL.VALIDATION] || "").trim();
+
+        // MOVE FIX:
+        // Nếu asset vẫn còn trên Jira nhưng Location hiện tại của Jira thuộc sheet khác,
+        // xóa row cũ khỏi sheet này. Row đúng sẽ được INSERT/UPDATE ở sheet đích.
+        // Tránh tình trạng sau khi update Location, asset nằm cả ở sheet cũ hoặc không tự chuyển sheet.
+        if (allKnownIds.has(id) && allAssetById instanceof Map) {
+          const canonical = allAssetById.get(id);
+          if (canonical) {
+            const targetLoc = String(canonical.location || "UNKNOWN").trim() || "UNKNOWN";
+            const targetSheet = locationSheetName(targetLoc);
+            if (targetSheet !== sheetName) {
+              rowsToDeleteBecauseMoved.push(idx + 1);
+              return;
+            }
+          }
+        }
 
         // Nếu asset vẫn nằm trong toàn bộ Jira IDs đã load xong,
         // không được mark Not in Jira chỉ vì nó không thuộc batch/location hiện tại.
@@ -885,6 +903,15 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
       }
 
       if (validationUpdates.length > 0) await context.sync();
+
+      // Delete stale rows from old location sheets after the correct location sheet has been written.
+      // Delete from bottom to top so Excel row indexes do not shift.
+      rowsToDeleteBecauseMoved.sort((a, b) => b - a);
+      for (const excelRow of rowsToDeleteBecauseMoved) {
+        sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT)
+          .delete(Excel.DeleteShiftDirection.up);
+      }
+      if (rowsToDeleteBecauseMoved.length > 0) await context.sync();
     }
 
     const toInsert = assets.filter(a => {
@@ -917,8 +944,9 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null) {
 
     const markCount = validationUpdates.filter(x => x.value === "Not in Jira").length;
     const clearCount = validationUpdates.filter(x => x.value === "").length;
+    const movedDeleteCount = rowsToDeleteBecauseMoved.length;
 
-    console.log(`[write] ${sheetName}: update=${updateRows.length}, mark=${markCount}, clear=${clearCount}, insert=${toInsert.length}`);
+    console.log(`[write] ${sheetName}: update=${updateRows.length}, mark=${markCount}, clear=${clearCount}, movedDelete=${movedDeleteCount}, insert=${toInsert.length}`);
   });
 }
 
@@ -1027,6 +1055,12 @@ async function runSync() {
         .filter(Boolean)
     );
 
+    const allAssetById = new Map();
+    allAssets.forEach(a => {
+      const id = String(a.id || "").trim();
+      if (id) allAssetById.set(id, a);
+    });
+
     const byLocation = {};
 
     allAssets.forEach(a => {
@@ -1051,7 +1085,8 @@ async function runSync() {
         sheetName,
         byLocation[sheetName] || [],
         now,
-        allKnownIds
+        allKnownIds,
+        allAssetById
       );
     }
 
