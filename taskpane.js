@@ -90,6 +90,33 @@ const CFG_KEYS = {
 let cfg      = {};
 let isSyncing = false;
 
+// Status attribute trong Jira Assets không phải text.
+// Excel hiển thị tên như "In Use", nhưng API cần status.id, ví dụ In Use -> 31.
+const STATUS_ATTR_ID = "5052";
+let statusNameToId = {};
+
+function normalizeStatusName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, " " );
+}
+
+function rememberStatusOption(name, id) {
+  const n = normalizeStatusName(name);
+  const sid = String(id || "").trim();
+  if (!n || !sid) return;
+  statusNameToId[n] = sid;
+}
+
+function getStatusIdFromCache(name) {
+  return statusNameToId[normalizeStatusName(name)] || "";
+}
+
+function listCachedStatusNames() {
+  return Object.keys(statusNameToId).sort().join(", ");
+}
+
 // ══════════════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════════════
@@ -296,18 +323,28 @@ async function fetchPage(qlQuery, startAt, pageSize) {
 
 // Parse 1 Jira object thành asset record
 function parseAsset(obj) {
+  const getAttrObj = (id) => (obj.attributes || []).find(
+    x => String(x.objectTypeAttributeId) === String(id)
+  );
+
   const attr = (id) => {
-    const a = (obj.attributes || []).find(
-      x => String(x.objectTypeAttributeId) === String(id)
-    );
+    const a = getAttrObj(id);
     return a?.objectAttributeValues?.[0]?.displayValue || "";
   };
+
+  const statusAttr = getAttrObj(STATUS_ATTR_ID);
+  const statusVal  = statusAttr?.objectAttributeValues?.[0] || null;
+  const statusName = statusVal?.displayValue || statusVal?.status?.name || "";
+  const statusId   = statusVal?.status?.id || "";
+  rememberStatusOption(statusName, statusId);
+
   return {
     id:           String(obj.id ?? obj.objectId ?? ""),
     key:          String(obj.objectKey || obj.key || ""),
     hostname:     attr(1737) || obj.label || "",
     serial:       attr(5194),
-    status:       attr(5052),
+    status:       statusName || attr(5052),
+    statusId:     String(statusId || ""),
     location:     attr(30125),
     region:       attr(27292),
     manufacturer: attr(6608),
@@ -443,7 +480,7 @@ async function fetchByOsBuild(typeId, osVer, parentQuery) {
   for (const build of builds) {
     const subQ = build === ""
       ? `${parentQuery} AND "OS Build" is EMPTY`
-      : `${parentQuery} AND "OS Build" = "${build.replace(/"/g, '\\"')}"`;
+      : `${parentQuery} AND "OS Build" = "${build.replace(/"/g, '\"')}"`;
 
     // Kiểm tra subTotal trước — nếu vẫn >= 1000 thì capped + warning
     const subTotal = await fetchTotalCount(subQ);
@@ -495,7 +532,7 @@ async function fetchByTypeId(typeId) {
     const ver  = versions[i];
     const subQ = ver === ""
       ? `${baseQ} AND "Version OS" is EMPTY`
-      : `${baseQ} AND "Version OS" = "${ver.replace(/"/g, '\\"')}"`;
+      : `${baseQ} AND "Version OS" = "${ver.replace(/"/g, '\"')}"`;
 
     toast(`  Version [${i+1}/${versions.length}]: "${ver || "(blank)"}"`, "warning");
     console.log(`[fetchByTypeId] sub-query: ${subQ}`);
@@ -1155,32 +1192,85 @@ function rowToJiraFields(row) {
     serial:   String(row[COL.SERIAL]   || "").trim(),
     location: String(row[COL.LOCATION] || "").trim(),
     status:   String(row[COL.STATUS]   || "").trim(),
-    purchase: String(row[COL.PURCHASE] || "").trim(),
+    purchase: normalizeJiraDate(row[COL.PURCHASE]),
   };
 }
 
-function jiraAttributesFromFields(fields) {
-  const attrMap = {
-    hostname: 1737,
-    serial:   5194,
-    location: 30125,
-    status:   5052,
-    purchase: 5203,
+function normalizeJiraDate(value) {
+  if (!value) return "";
+
+  // Excel date serial number -> YYYY-MM-DD
+  if (typeof value === "number") {
+    const d = new Date(Math.round((value - 25569) * 86400 * 1000));
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  // Đã đúng format Jira date
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+
+  const d = new Date(raw);
+  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+
+  return raw;
+}
+
+async function ensureStatusMap() {
+  if (Object.keys(statusNameToId).length > 0) return;
+
+  // Build map từ dữ liệu Jira hiện có. parseAsset() sẽ tự cache status.id.
+  toast("Đang tải Status map từ Jira...", "warning");
+  await fetchJiraAssets();
+
+  if (Object.keys(statusNameToId).length === 0) {
+    throw new Error("Không load được Status map từ Jira. Hãy Sync trước hoặc kiểm tra quyền Assets API.");
+  }
+}
+
+async function jiraAttributesFromFields(fields) {
+  const attributes = [];
+
+  const addValue = (objectTypeAttributeId, value) => {
+    const v = String(value || "").trim();
+    if (!v) return;
+    attributes.push({
+      objectTypeAttributeId,
+      objectAttributeValues: [{ value: v }],
+    });
   };
 
-  return Object.entries(fields)
-    .filter(([k, v]) => attrMap[k] !== undefined && v !== undefined && String(v).trim() !== "")
-    .map(([k, v]) => ({
-      objectTypeAttributeId: attrMap[k],
-      objectAttributeValues: [{ value: String(v).trim() }],
-    }));
+  addValue(1737, fields.hostname); // Hostname
+  addValue(5194, fields.serial);   // Serial Number
+  addValue(30125, fields.location); // Location đang là text theo JSON bạn gửi
+  addValue(5203, fields.purchase);  // Purchase Date, format YYYY-MM-DD
+
+  // Status là kiểu Status, không gửi text. Phải map tên -> status.id.
+  if (fields.status) {
+    await ensureStatusMap();
+    const statusId = getStatusIdFromCache(fields.status);
+
+    if (!statusId) {
+      throw new Error(
+        `Status "${fields.status}" không hợp lệ. Status hợp lệ đang cache: ${listCachedStatusNames() || "chưa có"}`
+      );
+    }
+
+    attributes.push({
+      objectTypeAttributeId: Number(STATUS_ATTR_ID),
+      objectAttributeValues: [{ value: statusId }],
+    });
+  }
+
+  return attributes;
 }
 
 async function updateJiraAsset(assetId, fields) {
   const id = String(assetId || "").trim();
   if (!id) throw new Error("Action x cần có Asset ID để update");
 
-  const attributes = jiraAttributesFromFields(fields);
+  const attributes = await jiraAttributesFromFields(fields);
   if (!attributes.length) throw new Error("Không có field nào để update");
 
   return assetsPut(`/object/${id}`, { attributes });
@@ -1213,7 +1303,7 @@ async function createJiraAssetFromRow(row) {
     throw new Error("Row mới cần ít nhất Hostname hoặc Serial Number");
   }
 
-  const attributes = jiraAttributesFromFields(fields);
+  const attributes = await jiraAttributesFromFields(fields);
   if (!attributes.length) {
     throw new Error("Không có field nào để create");
   }
