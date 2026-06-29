@@ -1,3 +1,4 @@
+
 /* ════════════════════════════════════════════════════════════
    Jira Asset Manager — Office Add-in
    PATCH: auto-move rows to correct Location sheet on sync
@@ -92,30 +93,43 @@ let cfg      = {};
 let isSyncing = false;
 
 // Status attribute trong Jira Assets không phải text.
-// Excel hiển thị tên như "In Use", nhưng API cần status.id, ví dụ In Use -> 31.
+// Excel hiển thị tên như "IN USE", nhưng API cần status.id, ví dụ IN USE -> 31.
 const STATUS_ATTR_ID = "5052";
 let statusNameToId = {};
+let statusIdToName = {};
+let statusOptionsLoaded = false;
 
 function normalizeStatusName(value) {
   return String(value || "")
     .trim()
     .toLowerCase()
-    .replace(/[\s_-]+/g, " " );
+    .replace(/[\s_-]+/g, " ");
 }
 
 function rememberStatusOption(name, id) {
-  const n = normalizeStatusName(name);
+  const rawName = String(name || "").trim();
+  const normalized = normalizeStatusName(rawName);
   const sid = String(id || "").trim();
-  if (!n || !sid) return;
-  statusNameToId[n] = sid;
+  if (!normalized || !sid) return;
+
+  // Lưu cả 2 chiều để vừa map API vừa tạo dropdown Excel.
+  statusNameToId[normalized] = sid;
+  statusIdToName[sid] = rawName.toUpperCase();
 }
 
 function getStatusIdFromCache(name) {
   return statusNameToId[normalizeStatusName(name)] || "";
 }
 
+function getCachedStatusNamesArray() {
+  return Object.values(statusIdToName)
+    .filter(Boolean)
+    .filter((v, i, arr) => arr.findIndex(x => normalizeStatusName(x) === normalizeStatusName(v)) === i)
+    .sort((a, b) => a.localeCompare(b));
+}
+
 function listCachedStatusNames() {
-  return Object.keys(statusNameToId).sort().join(", ");
+  return getCachedStatusNamesArray().join(", ");
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -206,6 +220,7 @@ function wireEvents() {
   on("btn-full-sync",      () => runSync());
   on("btn-sync-local",     matchLocalAssets);
   on("btn-update-jira",    processActionRows);
+  on("btn-refresh-status", applyStatusDropdownAllSheets);
   on("btn-save-cfg",       saveConfig);
   on("btn-test-conn",      testConnection);
 }
@@ -239,6 +254,19 @@ function jiraHeaders() {
     "Content-Type":  "application/json",
     "Accept":        "application/json",
   };
+}
+
+async function assetsGet(path) {
+  const res = await fetch(proxyUrl(`${assetsBase()}${path}`), {
+    method: "GET",
+    headers: jiraHeaders(),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Assets GET ${res.status}: ${(await res.text().catch(() => "")).slice(0,200)}`);
+  }
+
+  return res.json();
 }
 
 async function jiraGet(path) {
@@ -950,6 +978,54 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
   });
 }
 
+
+// ══════════════════════════════════════════════════════════════
+// STATUS DROPDOWN IN EXCEL
+// ══════════════════════════════════════════════════════════════
+async function applyStatusDropdownToSheet(context, sheet) {
+  const names = getCachedStatusNamesArray();
+  if (!names.length) return;
+
+  // Status hiện tại không có dấu phẩy. Nếu sau này có dấu phẩy, nên chuyển sang hidden metadata sheet.
+  const source = names.join(",");
+
+  // Áp dropdown cho 5000 dòng dưới header.
+  const range = sheet.getRangeByIndexes(1, COL.STATUS, 5000, 1);
+  range.dataValidation.rule = {
+    list: {
+      inCellDropDown: true,
+      source,
+    },
+  };
+
+  range.dataValidation.errorAlert = {
+    showAlert: true,
+    style: Excel.DataValidationAlertStyle.stop,
+    title: "Invalid Status",
+    message: `Chỉ chọn Status từ danh sách Jira: ${names.join(", ")}`,
+  };
+}
+
+async function applyStatusDropdownAllSheets() {
+  try {
+    await ensureStatusMap();
+
+    await Excel.run(async (context) => {
+      const sheets = await getLocationSheets(context);
+      for (const sheetName of sheets) {
+        const sheet = context.workbook.worksheets.getItem(sheetName);
+        await applyStatusDropdownToSheet(context, sheet);
+      }
+      await context.sync();
+    });
+
+    toast(`Đã cập nhật dropdown Status (${getCachedStatusNamesArray().length} giá trị)`, "success");
+  } catch (e) {
+    console.warn("applyStatusDropdownAllSheets:", e.message || e);
+    toast("Không cập nhật được dropdown Status: " + (e.message || e), "warning");
+  }
+}
+
 // ══════════════════════════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════════════════════════
@@ -1011,6 +1087,7 @@ async function createLocationSheets() {
       for (const loc of locations) {
         const sheet = await ensureSheet(context, locationSheetName(loc));
         await ensureHeaders(context, sheet);
+        await applyStatusDropdownToSheet(context, sheet);
       }
     });
     toast(`Created/verified ${locations.length} location sheet(s)`, "success");
@@ -1097,6 +1174,9 @@ async function runSync() {
         status: "done",
       })));
     }
+
+    // Sau sync, áp lại dropdown Status cho tất cả location sheets để user không gõ sai.
+    await applyStatusDropdownAllSheets();
 
     // Không tự động tạo LOCAL asset khi Full Sync.
     // Tạo mới chỉ được thực hiện thủ công bằng Action = "+"
@@ -1252,16 +1332,107 @@ function normalizeJiraDate(value) {
   return raw;
 }
 
+function ingestStatusResponse(data) {
+  const list = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.values)
+      ? data.values
+      : Array.isArray(data?.statusTypes)
+        ? data.statusTypes
+        : Array.isArray(data?.statuses)
+          ? data.statuses
+          : [];
+
+  let count = 0;
+  list.forEach(x => {
+    const id = x?.id ?? x?.statusId ?? x?.globalId;
+    const name = x?.name ?? x?.label ?? x?.displayValue;
+    if (id && name) {
+      rememberStatusOption(name, id);
+      count++;
+    }
+  });
+  return count;
+}
+
+async function fetchObjectSchemaIdsFromTypeIds() {
+  const schemaIds = new Set();
+  const typeIds = parseTypeIds();
+
+  for (const typeId of typeIds) {
+    try {
+      const ot = await assetsGet(`/objecttype/${encodeURIComponent(typeId)}`);
+      const schemaId = ot?.objectSchemaId || ot?.schemaId;
+      if (schemaId) schemaIds.add(String(schemaId));
+    } catch (e) {
+      console.warn(`[statusMap] cannot read objecttype ${typeId}:`, e.message || e);
+    }
+  }
+
+  return [...schemaIds];
+}
+
+async function loadStatusTypesFromApi() {
+  let total = 0;
+  const schemaIds = await fetchObjectSchemaIdsFromTypeIds();
+
+  for (const schemaId of schemaIds) {
+    const candidates = [
+      `/config/statustype?objectSchemaId=${encodeURIComponent(schemaId)}`,
+      `/config/statustype?objectSchemaId=${encodeURIComponent(schemaId)}&maxResults=100`,
+      `/config/status?objectSchemaId=${encodeURIComponent(schemaId)}`,
+      `/config/status?objectSchemaId=${encodeURIComponent(schemaId)}&maxResults=100`,
+    ];
+
+    for (const path of candidates) {
+      try {
+        const data = await assetsGet(path);
+        const added = ingestStatusResponse(data);
+        total += added;
+        if (added > 0) break;
+      } catch (e) {
+        console.warn(`[statusMap] ${path}:`, e.message || e);
+      }
+    }
+  }
+
+  if (total === 0) {
+    const candidates = ["/config/statustype", "/config/status"];
+    for (const path of candidates) {
+      try {
+        const data = await assetsGet(path);
+        const added = ingestStatusResponse(data);
+        total += added;
+        if (added > 0) break;
+      } catch (e) {
+        console.warn(`[statusMap] ${path}:`, e.message || e);
+      }
+    }
+  }
+
+  return total;
+}
+
 async function ensureStatusMap() {
-  if (Object.keys(statusNameToId).length > 0) return;
+  if (statusOptionsLoaded && Object.keys(statusNameToId).length > 0) return;
 
-  // Build map từ dữ liệu Jira hiện có. parseAsset() sẽ tự cache status.id.
-  toast("Đang tải Status map từ Jira...", "warning");
-  await fetchJiraAssets();
+  toast("Đang tải Status list từ Jira...", "warning");
 
+  // Ưu tiên lấy từ API config/schema để có đủ cả status chưa asset nào đang dùng.
+  await loadStatusTypesFromApi();
+
+  // Fallback: parse từ asset đang sync. Cách này chỉ lấy được status đã được dùng trong asset.
   if (Object.keys(statusNameToId).length === 0) {
+    await fetchJiraAssets();
+  }
+
+  statusOptionsLoaded = Object.keys(statusNameToId).length > 0;
+
+  if (!statusOptionsLoaded) {
     throw new Error("Không load được Status map từ Jira. Hãy Sync trước hoặc kiểm tra quyền Assets API.");
   }
+
+  console.log(`[statusMap] loaded ${getCachedStatusNamesArray().length} status: ${listCachedStatusNames()}`);
 }
 
 async function jiraAttributesFromFields(fields) {
