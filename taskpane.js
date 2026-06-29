@@ -1,4 +1,3 @@
-
 /* ════════════════════════════════════════════════════════════
    Jira Asset Manager — Office Add-in
    PATCH: auto-move rows to correct Location sheet on sync
@@ -221,6 +220,7 @@ function wireEvents() {
   on("btn-sync-local",     matchLocalAssets);
   on("btn-update-jira",    processActionRows);
   on("btn-refresh-status", applyStatusDropdownAllSheets);
+  on("btn-refresh-status-dropdown", applyStatusDropdownAllSheets);
   on("btn-save-cfg",       saveConfig);
   on("btn-test-conn",      testConnection);
 }
@@ -1372,8 +1372,118 @@ async function fetchObjectSchemaIdsFromTypeIds() {
   return [...schemaIds];
 }
 
+
+function extractArrayFromMaybeResponse(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.values)) return data.values;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.attributes)) return data.attributes;
+  if (Array.isArray(data?.objectTypeAttributes)) return data.objectTypeAttributes;
+  return [];
+}
+
+function extractStatusIdsFromAttribute(attr) {
+  const ids = new Set();
+
+  const add = (v) => {
+    const s = String(v ?? "").trim();
+    if (s) ids.add(s);
+  };
+
+  if (!attr) return ids;
+
+  // Jira Assets status attribute thường chứa allowed status IDs tại typeValueMulti.
+  if (Array.isArray(attr.typeValueMulti)) {
+    attr.typeValueMulti.forEach(add);
+  }
+
+  if (Array.isArray(attr.typeValues)) {
+    attr.typeValues.forEach(x => add(x?.id ?? x?.statusId ?? x));
+  }
+
+  if (Array.isArray(attr.options)) {
+    attr.options.forEach(x => add(x?.id ?? x?.statusId ?? x));
+  }
+
+  if (attr.typeValue) {
+    add(attr.typeValue?.id ?? attr.typeValue?.statusId ?? attr.typeValue);
+  }
+
+  if (attr.defaultType) {
+    add(attr.defaultType?.id ?? attr.defaultType?.statusId);
+  }
+
+  return ids;
+}
+
+async function loadStatusTypesFromObjectTypeAttributes() {
+  const typeIds = parseTypeIds();
+  const statusIds = new Set();
+
+  for (const typeId of typeIds) {
+    const candidates = [
+      `/objecttype/${encodeURIComponent(typeId)}/attributes`,
+      `/objecttype/${encodeURIComponent(typeId)}/attributes?includeChildren=true`,
+    ];
+
+    for (const path of candidates) {
+      try {
+        const data = await assetsGet(path);
+        const attrs = extractArrayFromMaybeResponse(data);
+
+        attrs.forEach(attr => {
+          const attrId = String(attr?.id ?? attr?.objectTypeAttributeId ?? "").trim();
+          const attrName = String(attr?.name ?? attr?.label ?? "").trim().toLowerCase();
+
+          // Ưu tiên đúng attribute ID 5052, fallback theo tên Status.
+          if (attrId === String(STATUS_ATTR_ID) || attrName === "status") {
+            extractStatusIdsFromAttribute(attr).forEach(id => statusIds.add(id));
+          }
+        });
+
+        if (statusIds.size > 0) break;
+      } catch (e) {
+        console.warn(`[statusMap] cannot read ${path}:`, e.message || e);
+      }
+    }
+  }
+
+  let added = 0;
+
+  for (const id of statusIds) {
+    const candidates = [
+      `/config/statustype/${encodeURIComponent(id)}`,
+      `/config/status/${encodeURIComponent(id)}`,
+    ];
+
+    for (const path of candidates) {
+      try {
+        const data = await assetsGet(path);
+        const before = Object.keys(statusNameToId).length;
+        ingestStatusResponse([data]);
+        const after = Object.keys(statusNameToId).length;
+
+        if (after > before) added++;
+        break;
+      } catch (e) {
+        console.warn(`[statusMap] cannot load status id=${id} by ${path}:`, e.message || e);
+      }
+    }
+  }
+
+  console.log(`[statusMap] attribute config IDs=${[...statusIds].join(",")} added=${added}`);
+  return added;
+}
+
+
 async function loadStatusTypesFromApi() {
   let total = 0;
+
+  // Cách chuẩn nhất cho dropdown Status:
+  // đọc object type attribute 5052 để lấy allowed status IDs trong typeValueMulti,
+  // sau đó gọi /config/statustype/{id}. Cách này lấy đủ cả status chưa asset nào đang dùng.
+  total += await loadStatusTypesFromObjectTypeAttributes();
+
   const schemaIds = await fetchObjectSchemaIdsFromTypeIds();
 
   for (const schemaId of schemaIds) {
@@ -1422,7 +1532,8 @@ async function ensureStatusMap() {
   await loadStatusTypesFromApi();
 
   // Fallback: parse từ asset đang sync. Cách này chỉ lấy được status đã được dùng trong asset.
-  if (Object.keys(statusNameToId).length === 0) {
+  // Nếu API/config chỉ trả một phần, fetchJiraAssets() vẫn có thể bổ sung thêm status đang có trong dữ liệu.
+  if (Object.keys(statusNameToId).length < 3) {
     await fetchJiraAssets();
   }
 
