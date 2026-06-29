@@ -1033,29 +1033,111 @@ async function refreshDashboard() {
   try {
     await Excel.run(async (context) => {
       const sheets = await getLocationSheets(context);
-      let total = 0, pending = 0, mismatch = 0, local = 0;
+
+      let total = 0;
+      let pending = 0;
+      let mismatch = 0;
+      let local = 0;
+
       const locSummary = [];
+
+      const norm = (v) => String(v || "").trim();
+      const upper = (v) => norm(v).toUpperCase();
+
+      function isRealAssetRow(row) {
+        const assetId = norm(row[COL.ASSET_ID]);
+        const assetKey = norm(row[COL.ASSET_KEY]);
+        const hostname = norm(row[COL.HOSTNAME]);
+        const serial = norm(row[COL.SERIAL]);
+        const syncStatus = upper(row[COL.SYNC_STATUS]);
+
+        // Chỉ tính row asset thật:
+        // - có Asset ID / Asset Key / Hostname / Serial
+        // - hoặc row LOCAL có nhập dữ liệu
+        return Boolean(
+          assetId ||
+          assetKey ||
+          hostname ||
+          serial ||
+          syncStatus === "LOCAL"
+        );
+      }
+
+      function isMismatch(row) {
+        const validation = norm(row[COL.VALIDATION]);
+        if (!validation) return false;
+
+        const v = validation.toUpperCase();
+
+        // OK thì không tính mismatch
+        if (v === "OK") return false;
+
+        // Row LOCAL không tính mismatch, vì nó chưa thuộc Jira
+        if (upper(row[COL.SYNC_STATUS]) === "LOCAL") return false;
+
+        return true;
+      }
+
+      function isPendingTicket(row) {
+        const action = upper(row[COL.ACTION]);
+        const caseJira = norm(row[COL.CASE_JIRA]);
+
+        return action === "CREATE TICKET" && !caseJira;
+      }
 
       for (const name of sheets) {
         const sheet = context.workbook.worksheets.getItem(name);
-        const rows  = await readSheetRows(context, sheet);
-        total += rows.length;
+        const rows = await readSheetRows(context, sheet);
+
+        let locTotal = 0;
         let locLocal = 0;
-        rows.forEach(r => {
-          if (r[COL.SYNC_STATUS] === "LOCAL")                              { local++; locLocal++; }
-          if (r[COL.VALIDATION]  && r[COL.VALIDATION] !== "OK")            mismatch++;
-          if (r[COL.ACTION] === "Create Ticket" && !r[COL.CASE_JIRA])      pending++;
+        let locMismatch = 0;
+
+        rows.forEach(row => {
+          if (!isRealAssetRow(row)) return;
+
+          locTotal++;
+          total++;
+
+          if (upper(row[COL.SYNC_STATUS]) === "LOCAL") {
+            locLocal++;
+            local++;
+          }
+
+          if (isMismatch(row)) {
+            locMismatch++;
+            mismatch++;
+          }
+
+          if (isPendingTicket(row)) {
+            pending++;
+          }
         });
-        locSummary.push({ name, count: rows.length, local: locLocal });
+
+        // Chỉ hiện sheet có asset thật
+        if (locTotal > 0) {
+          locSummary.push({
+            name,
+            count: locTotal,
+            local: locLocal,
+            mismatch: locMismatch,
+          });
+        }
       }
 
-      setInner("stat-total",    total    || "0");
-      setInner("stat-pending",  pending  || "0");
+      setInner("stat-total", total || "0");
+      setInner("stat-pending", pending || "0");
       setInner("stat-mismatch", mismatch || "0");
-      setInner("stat-local",    local    || "0");
-      if (cfg.lastSync) setInner("last-sync-time", formatTime(cfg.lastSync));
+      setInner("stat-local", local || "0");
+
+      if (cfg.lastSync) {
+        setInner("last-sync-time", formatTime(cfg.lastSync));
+      }
 
       const el = document.getElementById("location-summary");
+
+      if (!el) return;
+
       if (!locSummary.length) {
         el.innerHTML = `<div class="empty-state"><div class="icon">🗂</div>Sync to load locations</div>`;
       } else {
@@ -1066,10 +1148,14 @@ async function refreshDashboard() {
               <span class="loc-status done">${l.count} assets</span>
             </div>
             ${l.local > 0 ? `<div class="loc-count">⚠ ${l.local} LOCAL only</div>` : ""}
-          </div>`).join("");
+            ${l.mismatch > 0 ? `<div class="loc-count">⚠ ${l.mismatch} mismatch</div>` : ""}
+          </div>
+        `).join("");
       }
     });
-  } catch(e) { console.warn("refreshDashboard:", e.message); }
+  } catch (e) {
+    console.warn("refreshDashboard:", e.message);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
