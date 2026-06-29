@@ -86,6 +86,7 @@ const CFG_KEYS = {
   WORKER_URL:   "workerUrl",
   AQL_QUERY:    "aqlQuery",
   LAST_SYNC:    "lastSync",
+  JIRA_TOTAL:   "jiraTotal",
 };
 
 let cfg      = {};
@@ -157,6 +158,7 @@ function loadConfig() {
     workerUrl:   s.get(CFG_KEYS.WORKER_URL)   || "",
     aqlQuery:    s.get(CFG_KEYS.AQL_QUERY)    || "objectTypeId IN (525,527,529)",
     lastSync:    s.get(CFG_KEYS.LAST_SYNC)    || null,
+    jiraTotal:   Number(s.get(CFG_KEYS.JIRA_TOTAL) || 0),
   };
   updateWorkspaceLabel();
 }
@@ -1125,7 +1127,12 @@ async function refreshDashboard() {
         }
       }
 
-      setInner("stat-total", total || "0");
+      // Total Assets = tổng asset Jira từ lần sync gần nhất + LOCAL rows trong Excel.
+      // Không dùng mỗi row count vì Excel có thể chưa ghi đủ hoặc row bị bỏ qua bởi filter.
+      const jiraTotal = Number(cfg.jiraTotal || 0);
+      const dashboardTotal = jiraTotal > 0 ? jiraTotal + local : total;
+
+      setInner("stat-total", dashboardTotal || "0");
       setInner("stat-pending", pending || "0");
       setInner("stat-mismatch", mismatch || "0");
       setInner("stat-local", local || "0");
@@ -1212,6 +1219,11 @@ async function runSync() {
     // Không ghi + mark theo từng sub-batch.
     const allAssets = await fetchJiraAssets();
 
+    // Lưu tổng Jira asset từ lần sync gần nhất.
+    // Dashboard sẽ dùng số này + LOCAL rows để tránh lệch khi Excel chưa ghi đủ row.
+    cfg.jiraTotal = allAssets.length;
+    Office.context.document.settings.set(CFG_KEYS.JIRA_TOTAL, String(cfg.jiraTotal));
+
     const allKnownIds = new Set(
       allAssets
         .map(a => String(a.id || "").trim())
@@ -1269,6 +1281,7 @@ async function runSync() {
     // và chỉ khi SYNC_STATUS = LOCAL + Asset ID trống.
     cfg.lastSync = new Date().toISOString();
     Office.context.document.settings.set(CFG_KEYS.LAST_SYNC, cfg.lastSync);
+    Office.context.document.settings.set(CFG_KEYS.JIRA_TOTAL, String(cfg.jiraTotal || allAssets.length || 0));
     Office.context.document.settings.saveAsync();
 
     setSyncIndicator("ok", "Synced");
