@@ -1311,6 +1311,80 @@ async function updateJiraAsset(assetId, fields) {
   return assetsPut(`/object/${id}`, { attributes });
 }
 
+function escapeAqlString(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function normalizeSerial(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function baseAqlForSerialSearch() {
+  const raw = String(cfg.aqlQuery || "").trim();
+  if (raw) return `(${raw})`;
+
+  const typeIds = parseTypeIds();
+  if (typeIds.length) return `objectTypeId IN (${typeIds.join(",")})`;
+
+  throw new Error("AQL Query chưa cấu hình, không thể kiểm tra trùng Serial Number");
+}
+
+async function findJiraAssetBySerial(serial) {
+  const ser = String(serial || "").trim();
+  if (!ser) return null;
+
+  const qlQuery = `${baseAqlForSerialSearch()} AND "Serial Number" = "${escapeAqlString(ser)}"`;
+  const data = await fetchPage(qlQuery, 0, 10);
+  const values = data?.values || [];
+
+  if (!values.length) return null;
+
+  const exact = values
+    .map(o => parseAsset(o))
+    .find(a => normalizeSerial(a.serial) === normalizeSerial(ser));
+
+  return exact || parseAsset(values[0]);
+}
+
+async function createOrUpdateJiraAssetFromLocalRow(row) {
+  const assetId = String(row[COL.ASSET_ID] || "").trim();
+
+  if (assetId) {
+    throw new Error("Action + chỉ dùng cho row chưa có Asset ID");
+  }
+
+  if (!isLocalRow(row)) {
+    throw new Error('Action + chỉ xử lý khi Sync Status = "LOCAL"');
+  }
+
+  const fields = rowToJiraFields(row);
+  const serial = String(fields.serial || "").trim();
+
+  if (!serial) {
+    throw new Error("Action + cần Serial Number để kiểm tra trùng trước khi tạo mới");
+  }
+
+  // Kiểm tra toàn bộ asset theo AQL đang cấu hình.
+  // Nếu Serial đã tồn tại thì UPDATE object đó, không CREATE duplicate.
+  const existing = await findJiraAssetBySerial(serial);
+
+  if (existing?.id) {
+    await updateJiraAsset(existing.id, fields);
+    return {
+      mode: "updatedExisting",
+      asset: existing,
+      response: existing,
+    };
+  }
+
+  const res = await createJiraAssetFromRow(row);
+  return {
+    mode: "created",
+    asset: null,
+    response: res,
+  };
+}
+
 async function createJiraAssetFromRow(row) {
   const assetId = String(row[COL.ASSET_ID] || "").trim();
 
@@ -1362,7 +1436,7 @@ async function processActionRows() {
     return;
   }
 
-  toast('Đang xử lý Action: "x" = update, "+" = create LOCAL, "o" = xóa Jira + row...', "warning");
+  toast('Đang xử lý Action: "x" = update, "+" = match/update theo Serial hoặc create LOCAL, "o" = xóa Jira + row...', "warning");
 
   let updated = 0;
   let created = 0;
@@ -1440,17 +1514,22 @@ async function processActionRows() {
                 throw new Error('Action + chỉ tạo mới khi Sync Status = LOCAL');
               }
 
-              const res = await createJiraAssetFromRow(row);
+              const result = await createOrUpdateJiraAssetFromLocalRow(row);
+              const res = result.response || {};
+              const existingAsset = result.asset || {};
 
-              row[COL.ASSET_ID] = String(res?.id || res?.objectId || "");
-              row[COL.ASSET_KEY] = String(res?.objectKey || res?.key || "");
+              row[COL.ASSET_ID] = String(res?.id || res?.objectId || existingAsset.id || "");
+              row[COL.ASSET_KEY] = String(res?.objectKey || res?.key || existingAsset.key || "");
               row[COL.SYNC_STATUS] = "JIRA";
-              row[COL.VALIDATION] = "OK";
+              row[COL.VALIDATION] = result.mode === "updatedExisting" ? "OK - Matched by Serial" : "OK";
               row[COL.LAST_SYNC] = new Date().toISOString();
               row[COL.ACTION] = "";
 
               sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT).values = [row];
-              created++;
+
+              if (result.mode === "updatedExisting") updated++;
+              else created++;
+
               await context.sync();
               continue;
             }
