@@ -144,39 +144,7 @@ function listCachedStatusNames() {
 }
 
 function normalizeOwnerName(value) {
-  return String(value || "")
-    .trim()
-    .replace(/\s*\([^)]*\)\s*/g, " ")
-    .replace(/\s*\[[^\]]*\]\s*/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function ownerNameAliases(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return [];
-
-  const noParen = raw
-    .replace(/\s*\([^)]*\)\s*/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const aliases = new Set([raw, noParen]);
-
-  // "Dai, Dexter" -> "Dexter Dai"
-  const commaName = noParen.match(/^([^,]+),\s*(.+)$/);
-  if (commaName) {
-    aliases.add(`${commaName[2]} ${commaName[1]}`.trim());
-  }
-
-  // "Dai, Dexter (Doan Duc Dai | Information Technology)" -> "Doan Duc Dai"
-  const inside = raw.match(/\(([^|)]+)(?:\|[^)]*)?\)/);
-  if (inside && inside[1]) {
-    aliases.add(inside[1].trim());
-  }
-
-  return [...aliases].map(x => String(x || "").trim()).filter(Boolean);
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function rememberOwnerOption(owner) {
@@ -188,38 +156,14 @@ function rememberOwnerOption(owner) {
   const username = String(owner?.username || owner?.userName || owner?.searchValue || "").trim() || key || label;
 
   const item = { id, key, label, username };
-
-  ownerNameAliases(label).forEach(alias => {
-    ownerNameToObject[normalizeOwnerName(alias)] = item;
-  });
-
-  ownerNameAliases(username).forEach(alias => {
-    ownerNameToObject[normalizeOwnerName(alias)] = item;
-  });
-
+  ownerNameToObject[normalizeOwnerName(label)] = item;
   if (key) ownerKeyToObject[key.toUpperCase()] = item;
 }
 
 function getOwnerFromCache(value) {
   const raw = String(value || "").trim();
   if (!raw) return null;
-
-  const byKey = ownerKeyToObject[raw.toUpperCase()];
-  if (byKey) return byKey;
-
-  for (const alias of ownerNameAliases(raw)) {
-    const found = ownerNameToObject[normalizeOwnerName(alias)];
-    if (found) return found;
-  }
-
-  // Fallback mềm: fix case "Dai, Dexter (Doan Duc Dai | Information Technology)".
-  const needle = normalizeOwnerName(raw);
-  for (const [k, owner] of Object.entries(ownerNameToObject)) {
-    if (!k || !needle) continue;
-    if (k.includes(needle) || needle.includes(k)) return owner;
-  }
-
-  return null;
+  return ownerNameToObject[normalizeOwnerName(raw)] || ownerKeyToObject[raw.toUpperCase()] || null;
 }
 
 function getCachedOwnerNamesArray() {
@@ -265,20 +209,6 @@ function parseOwnerObject(obj) {
   if (!owner.username) owner.username = owner.key || owner.label;
 
   rememberOwnerOption(owner);
-
-  [
-    obj?.displayValue,
-    obj?.searchValue,
-    obj?.name,
-    obj?.label,
-    obj?.objectKey,
-    obj?.key,
-  ].forEach(v => {
-    ownerNameAliases(v).forEach(alias => {
-      ownerNameToObject[normalizeOwnerName(alias)] = owner;
-    });
-  });
-
   return owner;
 }
 
@@ -526,30 +456,11 @@ function parseAsset(obj) {
   const ownerVal = ownerAttr?.objectAttributeValues?.[0] || null;
   const ownerRef = ownerVal?.referencedObject || null;
   if (ownerRef) {
-    const ownerItem = {
+    rememberOwnerOption({
       id: ownerRef.id,
       key: ownerRef.objectKey,
       label: ownerRef.label || ownerRef.name || ownerVal.displayValue,
       username: ownerVal.searchValue || ownerRef.objectKey || "",
-    };
-
-    rememberOwnerOption(ownerItem);
-
-    [
-      ownerVal.displayValue,
-      ownerVal.searchValue,
-      ownerRef.label,
-      ownerRef.name,
-      ownerRef.objectKey,
-    ].forEach(v => {
-      ownerNameAliases(v).forEach(alias => {
-        ownerNameToObject[normalizeOwnerName(alias)] = {
-          id: String(ownerItem.id || ""),
-          key: String(ownerItem.key || ""),
-          label: String(ownerItem.label || ""),
-          username: String(ownerItem.username || ownerItem.key || ownerItem.label || ""),
-        };
-      });
     });
   }
 
@@ -1411,8 +1322,59 @@ async function fetchOwnersFromJira() {
   return owners;
 }
 
-async function ensureOwnerMap() {
+
+async function loadOwnerMapFromMetadataSheet() {
+  // Đọc cache Owner từ sheet _SYS_OWNER_METADATA nếu đã refresh trước đó.
+  // Hàm này KHÔNG gọi Jira API.
+  try {
+    await Excel.run(async (context) => {
+      const sheet = context.workbook.worksheets.getItemOrNullObject(OWNER_METADATA_SHEET);
+      await context.sync();
+
+      if (sheet.isNullObject) return;
+
+      const used = sheet.getUsedRangeOrNullObject(true);
+      await context.sync();
+
+      if (used.isNullObject) return;
+
+      used.load(["values", "rowCount"]);
+      await context.sync();
+
+      if (used.rowCount <= 1) return;
+
+      const rows = used.values.slice(1);
+      rows.forEach(r => {
+        const label = String(r[0] || "").trim();
+        const id = String(r[1] || "").trim();
+        const key = String(r[2] || "").trim();
+        const username = String(r[3] || "").trim();
+
+        if (label && id) {
+          rememberOwnerOption({ id, key, label, username });
+        }
+      });
+    });
+
+    ownerOptionsLoaded = getCachedOwnerNamesArray().length > 0;
+    return ownerOptionsLoaded;
+  } catch (e) {
+    console.warn("loadOwnerMapFromMetadataSheet:", e.message || e);
+    return false;
+  }
+}
+
+async function ensureOwnerMap(forceApiLoad = false) {
   if (ownerOptionsLoaded && getCachedOwnerNamesArray().length > 0) return;
+
+  // Ưu tiên đọc cache từ _SYS_OWNER_METADATA để Update Jira không tự tải 13k users.
+  const loadedFromSheet = await loadOwnerMapFromMetadataSheet();
+  if (loadedFromSheet) return;
+
+  if (!forceApiLoad) {
+    throw new Error('Owner list chưa được tải. Hãy bấm "Refresh Metadata" trước khi Update/Create Owner.');
+  }
+
   toast("Đang tải Owner list từ Jira...", "warning");
   await fetchOwnersFromJira();
 
@@ -1500,14 +1462,14 @@ async function applyOwnerDropdownAllSheets() {
 }
 
 async function refreshMetadataDropdowns() {
-  // Nút "Refresh Status Dropdown" giờ refresh cả Status + Owner.
-  // Không full sync asset, không ghi asset data.
+  // Refresh Metadata chỉ tải Status + Owner và áp dụng dropdown.
+  // Không sync asset, không ghi dữ liệu asset.
   try {
     statusOptionsLoaded = false;
     ownerOptionsLoaded = false;
 
     await ensureStatusMap();
-    await ensureOwnerMap();
+    await ensureOwnerMap(true);
 
     await Excel.run(async (context) => {
       const sheets = await getLocationSheets(context);
@@ -1525,12 +1487,12 @@ async function refreshMetadataDropdowns() {
     await registerOwnerChangeHandlers();
 
     toast(
-      `Đã refresh metadata: Status=${getCachedStatusNamesArray().length}, Owner=${getCachedOwnerNamesArray().length}`,
+      `Refresh Metadata xong: Status=${getCachedStatusNamesArray().length}, Owner=${getCachedOwnerNamesArray().length}`,
       "success"
     );
   } catch (e) {
     console.warn("refreshMetadataDropdowns:", e.message || e);
-    toast("Refresh metadata lỗi: " + (e.message || e), "warning");
+    toast("Refresh Metadata lỗi: " + (e.message || e), "warning");
   }
 }
 
@@ -1742,16 +1704,11 @@ async function createLocationSheets() {
     const locations = [...new Set(assets.map(a => a.location).filter(Boolean))];
     if (!locations.length) { toast("No locations found", "warning"); return; }
 
-    await ensureOwnerMap();
-
     await Excel.run(async (context) => {
-      const ownerSource = await writeOwnerMetadataSheet(context);
-
       for (const loc of locations) {
         const sheet = await ensureSheet(context, locationSheetName(loc));
         await ensureHeaders(context, sheet);
         await applyStatusDropdownToSheet(context, sheet);
-        await applyOwnerDropdownToSheet(context, sheet, ownerSource);
       }
     });
     toast(`Created/verified ${locations.length} location sheet(s)`, "success");
@@ -1844,9 +1801,10 @@ async function runSync() {
       })));
     }
 
-    // Sau sync, áp lại dropdown Status và Owner cho tất cả location sheets để user không gõ sai.
+    // Full Sync chỉ sync asset + áp lại Status dropdown nhẹ.
+    // Owner list >1000 records nên KHÔNG load trong Full Sync.
+    // Muốn cập nhật Owner dropdown thì bấm nút "Refresh Metadata".
     await applyStatusDropdownAllSheets();
-    await applyOwnerDropdownAllSheets();
 
     // Không tự động tạo LOCAL asset khi Full Sync.
     // Tạo mới chỉ được thực hiện thủ công bằng Action = "+"
@@ -2253,19 +2211,13 @@ async function jiraAttributesFromFields(fields) {
   }
 
   // Assigned User / Owner là reference object.
+  // Không tự tải 13k users trong Update Jira. Chỉ dùng cache từ Refresh Metadata.
   if (fields.owner) {
-    await ensureOwnerMap();
-    let owner = getOwnerFromCache(fields.owner);
-
-    // Cache cũ có thể thiếu alias, refresh Owner list 1 lần rồi match lại.
-    if (!owner?.id) {
-      ownerOptionsLoaded = false;
-      await ensureOwnerMap();
-      owner = getOwnerFromCache(fields.owner);
-    }
+    await ensureOwnerMap(false);
+    const owner = getOwnerFromCache(fields.owner);
 
     if (!owner?.id) {
-      throw new Error(`Owner "${fields.owner}" không có trong Owner list Jira`);
+      throw new Error(`Owner "${fields.owner}" không có trong cache Owner. Hãy bấm "Refresh Metadata" rồi chọn lại Owner từ dropdown.`);
     }
 
     attributes.push({
