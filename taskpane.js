@@ -99,6 +99,17 @@ let statusNameToId = {};
 let statusIdToName = {};
 let statusOptionsLoaded = false;
 
+// Owner/Assigned User là reference object.
+// Assigned User dùng attribute 26690 và trỏ tới objectTypeId=269 (Users).
+const OWNER_ATTR_ID = "26690";
+const OWNER_OBJECT_TYPE_ID = "269";
+const OWNER_METADATA_SHEET = "_SYS_OWNER_METADATA";
+
+let ownerNameToObject = {};
+let ownerKeyToObject = {};
+let ownerOptionsLoaded = false;
+let ownerChangeHandlersRegistered = false;
+
 function normalizeStatusName(value) {
   return String(value || "")
     .trim()
@@ -132,6 +143,75 @@ function listCachedStatusNames() {
   return getCachedStatusNamesArray().join(", ");
 }
 
+function normalizeOwnerName(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function rememberOwnerOption(owner) {
+  const id = String(owner?.id || owner?.objectId || "").trim();
+  const key = String(owner?.key || owner?.objectKey || "").trim();
+  const label = String(owner?.label || owner?.name || owner?.displayValue || "").trim();
+  if (!id || !label) return;
+
+  const username = String(owner?.username || owner?.userName || owner?.searchValue || "").trim() || key || label;
+
+  const item = { id, key, label, username };
+  ownerNameToObject[normalizeOwnerName(label)] = item;
+  if (key) ownerKeyToObject[key.toUpperCase()] = item;
+}
+
+function getOwnerFromCache(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  return ownerNameToObject[normalizeOwnerName(raw)] || ownerKeyToObject[raw.toUpperCase()] || null;
+}
+
+function getCachedOwnerNamesArray() {
+  const seen = new Set();
+  return Object.values(ownerNameToObject)
+    .map(o => String(o.label || "").trim())
+    .filter(Boolean)
+    .filter(name => {
+      const k = normalizeOwnerName(name);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function parseOwnerObject(obj) {
+  const owner = {
+    id: String(obj?.id ?? obj?.objectId ?? ""),
+    key: String(obj?.objectKey || obj?.key || ""),
+    label: String(obj?.label || obj?.name || ""),
+    username: "",
+  };
+
+  const attrs = obj?.attributes || [];
+  for (const a of attrs) {
+    const vals = a?.objectAttributeValues || [];
+    const v = vals[0] || {};
+    const display = String(v.displayValue || v.value || v.searchValue || "").trim();
+    const attrName = String(a.name || a.label || "").toLowerCase();
+
+    if (!owner.username && display && (
+      attrName.includes("username") ||
+      attrName.includes("user name") ||
+      attrName.includes("email") ||
+      attrName.includes("mail") ||
+      attrName.includes("login")
+    )) {
+      owner.username = display;
+    }
+  }
+
+  if (!owner.username) owner.username = owner.key || owner.label;
+
+  rememberOwnerOption(owner);
+  return owner;
+}
+
 // ══════════════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════════════
@@ -141,6 +221,7 @@ Office.onReady(async (info) => {
   populateConfigUI();
   wireEvents();
   await refreshDashboard();
+  await registerOwnerChangeHandlers();
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -223,6 +304,8 @@ function wireEvents() {
   on("btn-update-jira",    processActionRows);
   on("btn-refresh-status", applyStatusDropdownAllSheets);
   on("btn-refresh-status-dropdown", applyStatusDropdownAllSheets);
+  on("btn-refresh-owner", applyOwnerDropdownAllSheets);
+  on("btn-refresh-owner-dropdown", applyOwnerDropdownAllSheets);
   on("btn-save-cfg",       saveConfig);
   on("btn-test-conn",      testConnection);
 }
@@ -368,6 +451,18 @@ function parseAsset(obj) {
   const statusName = statusVal?.displayValue || statusVal?.status?.name || "";
   const statusId   = statusVal?.status?.id || "";
   rememberStatusOption(statusName, statusId);
+
+  const ownerAttr = getAttrObj(OWNER_ATTR_ID);
+  const ownerVal = ownerAttr?.objectAttributeValues?.[0] || null;
+  const ownerRef = ownerVal?.referencedObject || null;
+  if (ownerRef) {
+    rememberOwnerOption({
+      id: ownerRef.id,
+      key: ownerRef.objectKey,
+      label: ownerRef.label || ownerRef.name || ownerVal.displayValue,
+      username: ownerVal.searchValue || ownerRef.objectKey || "",
+    });
+  }
 
   return {
     id:           String(obj.id ?? obj.objectId ?? ""),
@@ -1029,6 +1124,181 @@ async function applyStatusDropdownAllSheets() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// OWNER DROPDOWN IN EXCEL
+// ══════════════════════════════════════════════════════════════
+async function fetchOwnersFromJira() {
+  const owners = [];
+  const PAGE = 100;
+  const qlQuery = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
+  const total = await fetchTotalCount(qlQuery).catch(() => 0);
+  const limit = Math.min(total || API_LIMIT, API_LIMIT);
+
+  for (let startAt = 0; startAt < limit; startAt += PAGE) {
+    const size = Math.min(PAGE, limit - startAt);
+    const data = await fetchPage(qlQuery, startAt, size);
+    const values = data?.values || [];
+    if (!values.length) break;
+    values.forEach(obj => owners.push(parseOwnerObject(obj)));
+  }
+
+  if (total > API_LIMIT) {
+    console.warn(`[ownerMap] Users total=${total}, loaded only first ${API_LIMIT}.`);
+    toast(`⚠ Owner list có ${total} users, chỉ load ${API_LIMIT} đầu tiên`, "warning");
+  }
+
+  ownerOptionsLoaded = owners.length > 0;
+  console.log(`[ownerMap] loaded ${owners.length} owners`);
+  return owners;
+}
+
+async function ensureOwnerMap() {
+  if (ownerOptionsLoaded && getCachedOwnerNamesArray().length > 0) return;
+  toast("Đang tải Owner list từ Jira...", "warning");
+  await fetchOwnersFromJira();
+
+  if (!ownerOptionsLoaded) {
+    throw new Error("Không load được Owner list từ Jira. Kiểm tra objectTypeId Users hoặc quyền Assets API.");
+  }
+}
+
+async function ensureOwnerMetadataSheet(context) {
+  let sheet = context.workbook.worksheets.getItemOrNullObject(OWNER_METADATA_SHEET);
+  await context.sync();
+
+  if (sheet.isNullObject) {
+    sheet = context.workbook.worksheets.add(OWNER_METADATA_SHEET);
+    await context.sync();
+  }
+
+  try { sheet.visibility = Excel.SheetVisibility.hidden; } catch (_) {}
+  return sheet;
+}
+
+async function writeOwnerMetadataSheet(context) {
+  const names = getCachedOwnerNamesArray();
+  if (!names.length) return null;
+
+  const sheet = await ensureOwnerMetadataSheet(context);
+  const used = sheet.getUsedRangeOrNullObject(true);
+  await context.sync();
+
+  if (!used.isNullObject) used.clear(Excel.ClearApplyTo.all);
+
+  sheet.getRangeByIndexes(0, 0, 1, 4).values = [["Owner Name", "Owner ID", "Owner Key", "Username"]];
+
+  const rows = names.map(name => {
+    const o = getOwnerFromCache(name) || {};
+    return [name, o.id || "", o.key || "", o.username || ""];
+  });
+
+  sheet.getRangeByIndexes(1, 0, rows.length, 4).values = rows;
+
+  try { sheet.visibility = Excel.SheetVisibility.hidden; } catch (_) {}
+  await context.sync();
+
+  return `=${OWNER_METADATA_SHEET}!$A$2:$A$${rows.length + 1}`;
+}
+
+async function applyOwnerDropdownToSheet(context, sheet, ownerSourceRangeFormula) {
+  if (!ownerSourceRangeFormula) return;
+
+  const assignedRange = sheet.getRangeByIndexes(1, COL.ASSIGNED, 5000, 1);
+  assignedRange.dataValidation.rule = {
+    list: { inCellDropDown: true, source: ownerSourceRangeFormula },
+  };
+
+  assignedRange.dataValidation.errorAlert = {
+    showAlert: true,
+    style: Excel.DataValidationAlertStyle.warning,
+    title: "Owner not in Jira list",
+    message: "Nên chọn Owner từ danh sách Jira để update/create đúng reference.",
+  };
+}
+
+async function applyOwnerDropdownAllSheets() {
+  try {
+    await ensureOwnerMap();
+
+    await Excel.run(async (context) => {
+      const ownerSource = await writeOwnerMetadataSheet(context);
+      const sheets = await getLocationSheets(context);
+
+      for (const sheetName of sheets) {
+        const sheet = context.workbook.worksheets.getItem(sheetName);
+        await applyOwnerDropdownToSheet(context, sheet, ownerSource);
+      }
+
+      await context.sync();
+    });
+
+    await registerOwnerChangeHandlers();
+    toast(`Đã cập nhật dropdown Owner (${getCachedOwnerNamesArray().length} users)`, "success");
+  } catch (e) {
+    console.warn("applyOwnerDropdownAllSheets:", e.message || e);
+    toast("Không cập nhật được dropdown Owner: " + (e.message || e), "warning");
+  }
+}
+
+async function syncUsernameForOwnerSelection(context, sheet, rowIndex, ownerName) {
+  const owner = getOwnerFromCache(ownerName);
+  if (!owner) return false;
+  const username = owner.username || owner.key || "";
+  if (!username) return false;
+  sheet.getRangeByIndexes(rowIndex, COL.USERNAME, 1, 1).values = [[username]];
+  return true;
+}
+
+async function registerOwnerChangeHandlers() {
+  if (ownerChangeHandlersRegistered) return;
+
+  try {
+    await Excel.run(async (context) => {
+      const sheets = await getLocationSheets(context);
+
+      for (const sheetName of sheets) {
+        const sheet = context.workbook.worksheets.getItem(sheetName);
+
+        sheet.onChanged.add(async (event) => {
+          try {
+            if (!event || !event.address) return;
+
+            await Excel.run(async (ctx) => {
+              const ws = ctx.workbook.worksheets.getItem(sheetName);
+              const changed = ws.getRange(event.address);
+              changed.load(["rowIndex", "columnIndex", "rowCount", "columnCount", "values"]);
+              await ctx.sync();
+
+              if (changed.columnIndex > COL.ASSIGNED ||
+                  changed.columnIndex + changed.columnCount - 1 < COL.ASSIGNED) {
+                return;
+              }
+
+              for (let r = 0; r < changed.rowCount; r++) {
+                const absoluteRow = changed.rowIndex + r;
+                if (absoluteRow === 0) continue;
+
+                const relativeOwnerCol = COL.ASSIGNED - changed.columnIndex;
+                const ownerName = changed.values?.[r]?.[relativeOwnerCol] || "";
+                await syncUsernameForOwnerSelection(ctx, ws, absoluteRow, ownerName);
+              }
+
+              await ctx.sync();
+            });
+          } catch (e) {
+            console.warn("[ownerChange] failed:", e.message || e);
+          }
+        });
+      }
+
+      await context.sync();
+      ownerChangeHandlersRegistered = true;
+    });
+  } catch (e) {
+    console.warn("registerOwnerChangeHandlers:", e.message || e);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════════════════════════
 async function refreshDashboard() {
@@ -1176,11 +1446,16 @@ async function createLocationSheets() {
     const locations = [...new Set(assets.map(a => a.location).filter(Boolean))];
     if (!locations.length) { toast("No locations found", "warning"); return; }
 
+    await ensureOwnerMap();
+
     await Excel.run(async (context) => {
+      const ownerSource = await writeOwnerMetadataSheet(context);
+
       for (const loc of locations) {
         const sheet = await ensureSheet(context, locationSheetName(loc));
         await ensureHeaders(context, sheet);
         await applyStatusDropdownToSheet(context, sheet);
+        await applyOwnerDropdownToSheet(context, sheet, ownerSource);
       }
     });
     toast(`Created/verified ${locations.length} location sheet(s)`, "success");
@@ -1273,8 +1548,9 @@ async function runSync() {
       })));
     }
 
-    // Sau sync, áp lại dropdown Status cho tất cả location sheets để user không gõ sai.
+    // Sau sync, áp lại dropdown Status và Owner cho tất cả location sheets để user không gõ sai.
     await applyStatusDropdownAllSheets();
+    await applyOwnerDropdownAllSheets();
 
     // Không tự động tạo LOCAL asset khi Full Sync.
     // Tạo mới chỉ được thực hiện thủ công bằng Action = "+"
@@ -1406,6 +1682,7 @@ function rowToJiraFields(row) {
     serial:   String(row[COL.SERIAL]   || "").trim(),
     location: String(row[COL.LOCATION] || "").trim(),
     status:   String(row[COL.STATUS]   || "").trim(),
+    owner:    String(row[COL.ASSIGNED]  || "").trim(),
     purchase: normalizeJiraDate(row[COL.PURCHASE]),
   };
 }
@@ -1679,6 +1956,21 @@ async function jiraAttributesFromFields(fields) {
     });
   }
 
+  // Assigned User / Owner là reference object.
+  if (fields.owner) {
+    await ensureOwnerMap();
+    const owner = getOwnerFromCache(fields.owner);
+
+    if (!owner?.id) {
+      throw new Error(`Owner "${fields.owner}" không có trong Owner list Jira`);
+    }
+
+    attributes.push({
+      objectTypeAttributeId: Number(OWNER_ATTR_ID),
+      objectAttributeValues: [{ referencedObjectBeanId: Number(owner.id) }],
+    });
+  }
+
   return attributes;
 }
 
@@ -1872,7 +2164,11 @@ async function processActionRows() {
                 throw new Error('Action x chỉ update row đã có Asset ID. Muốn tạo mới hãy nhập Action = "+"');
               }
 
-              await updateJiraAsset(assetId, rowToJiraFields(row));
+              const fields = rowToJiraFields(row);
+              const owner = getOwnerFromCache(fields.owner);
+              if (owner?.username) row[COL.USERNAME] = owner.username;
+
+              await updateJiraAsset(assetId, fields);
 
               row[COL.SYNC_STATUS] = "JIRA";
               row[COL.VALIDATION] = "OK";
@@ -1894,6 +2190,10 @@ async function processActionRows() {
               if (!isLocalRow(row)) {
                 throw new Error('Action + chỉ tạo mới khi Sync Status = LOCAL');
               }
+
+              const localFields = rowToJiraFields(row);
+              const owner = getOwnerFromCache(localFields.owner);
+              if (owner?.username) row[COL.USERNAME] = owner.username;
 
               const result = await createOrUpdateJiraAssetFromLocalRow(row);
               const res = result.response || {};
