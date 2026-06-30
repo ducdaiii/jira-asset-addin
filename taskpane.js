@@ -1126,28 +1126,199 @@ async function applyStatusDropdownAllSheets() {
 // ══════════════════════════════════════════════════════════════
 // OWNER DROPDOWN IN EXCEL
 // ══════════════════════════════════════════════════════════════
-async function fetchOwnersFromJira() {
-  const owners = [];
+function ownerDedupKey(owner) {
+  const id = String(owner?.id || "").trim();
+  if (id) return `id:${id}`;
+
+  const key = String(owner?.key || "").trim().toUpperCase();
+  if (key) return `key:${key}`;
+
+  const label = normalizeOwnerName(owner?.label || "");
+  if (label) return `label:${label}`;
+
+  return "";
+}
+
+async function fetchOwnersUnderLimit(qlQuery) {
   const PAGE = 100;
-  const qlQuery = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
-  const total = await fetchTotalCount(qlQuery).catch(() => 0);
-  const limit = Math.min(total || API_LIMIT, API_LIMIT);
+  const owners = [];
+  const seenPageSignatures = new Set();
 
-  for (let startAt = 0; startAt < limit; startAt += PAGE) {
-    const size = Math.min(PAGE, limit - startAt);
-    const data = await fetchPage(qlQuery, startAt, size);
-    const values = data?.values || [];
+  const first = await fetchPage(qlQuery, 0, PAGE);
+  const total = typeof first.total === "number" ? first.total : 0;
+  const firstVals = first.values || [];
+
+  const pushPage = (values, startAt) => {
+    const parsed = (values || []).map(o => parseOwnerObject(o));
+
+    const sig = parsed
+      .map(o => String(o.id || o.key || o.label || "").trim())
+      .join("|");
+
+    if (sig && seenPageSignatures.has(sig)) {
+      console.warn(`[ownerMap] duplicate page at startAt=${startAt}. Pagination not moving.`);
+      return false;
+    }
+
+    if (sig) seenPageSignatures.add(sig);
+    parsed.forEach(o => owners.push(o));
+    return true;
+  };
+
+  pushPage(firstVals, 0);
+
+  if (total === 0 || firstVals.length === 0) return owners;
+
+  let startAt = firstVals.length;
+
+  while (owners.length < total && startAt < API_LIMIT) {
+    const remaining = total - owners.length;
+    const pageSize = Math.min(PAGE, remaining, API_LIMIT - startAt);
+    if (pageSize <= 0) break;
+
+    const data = await fetchPage(qlQuery, startAt, pageSize);
+    const values = data.values || [];
     if (!values.length) break;
-    values.forEach(obj => owners.push(parseOwnerObject(obj)));
+
+    const ok = pushPage(values, startAt);
+    if (!ok) break;
+
+    startAt += values.length;
   }
 
-  if (total > API_LIMIT) {
-    console.warn(`[ownerMap] Users total=${total}, loaded only first ${API_LIMIT}.`);
-    toast(`⚠ Owner list có ${total} users, chỉ load ${API_LIMIT} đầu tiên`, "warning");
+  if (owners.length > total && total > 0) {
+    owners.length = total;
   }
+
+  return owners;
+}
+
+function buildOwnerSplitQueries(baseQ, attrName) {
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+  const digits = "0123456789".split("");
+  const queries = [];
+
+  // Jira Assets AQL thường hỗ trợ LIKE với wildcard.
+  // Với Users, label/name thường bắt đầu bằng Last name, ví dụ "Thu, Lisa...".
+  letters.forEach(ch => {
+    queries.push(`${baseQ} AND "${attrName}" LIKE "${ch}%"`);
+  });
+
+  digits.forEach(ch => {
+    queries.push(`${baseQ} AND "${attrName}" LIKE "${ch}%"`);
+  });
+
+  // Bucket cho tên không bắt đầu bằng chữ/số.
+  // Nếu Jira không support nhiều NOT LIKE, query này sẽ fail nhẹ và bị bỏ qua.
+  const notLike = [...letters, ...digits]
+    .map(ch => `"${attrName}" NOT LIKE "${ch}%"`)
+    .join(" AND ");
+
+  queries.push(`${baseQ} AND ${notLike}`);
+
+  return queries;
+}
+
+async function fetchOwnersSplitByAttribute(attrName) {
+  const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
+  const queries = buildOwnerSplitQueries(baseQ, attrName);
+
+  const seen = new Map();
+  let rawFetched = 0;
+  let successBuckets = 0;
+
+  for (const q of queries) {
+    try {
+      const total = await fetchTotalCount(q);
+      if (total === 0) continue;
+
+      if (total >= API_LIMIT) {
+        console.warn(`[ownerMap] bucket still >= ${API_LIMIT}: ${q} total=${total}`);
+        toast(`⚠ Owner bucket "${attrName}" vẫn >= ${API_LIMIT}; có thể thiếu user trong bucket này`, "warning");
+      }
+
+      const list = await fetchOwnersUnderLimit(q);
+      rawFetched += list.length;
+      successBuckets++;
+
+      list.forEach(o => {
+        const k = ownerDedupKey(o);
+        if (!k) return;
+        if (!seen.has(k)) seen.set(k, o);
+      });
+
+      console.log(`[ownerMap] bucket attr="${attrName}" total=${total}, fetched=${list.length}, unique=${seen.size}`);
+    } catch (e) {
+      console.warn(`[ownerMap] split query failed attr="${attrName}":`, e.message || e);
+    }
+  }
+
+  return {
+    owners: [...seen.values()],
+    rawFetched,
+    successBuckets,
+  };
+}
+
+async function fetchOwnersFromJira() {
+  // Reset cache để Refresh Owner luôn lấy mới.
+  ownerNameToObject = {};
+  ownerKeyToObject = {};
+  ownerOptionsLoaded = false;
+
+  const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
+  const total = await fetchTotalCount(baseQ).catch(() => 0);
+
+  console.log(`[ownerMap] total Users=${total}`);
+
+  let owners = [];
+
+  if (total > 0 && total < API_LIMIT) {
+    owners = await fetchOwnersUnderLimit(baseQ);
+  } else {
+    // Users >= 1000: chia theo attribute tên giống cách device chia theo Version OS.
+    // Thử nhiều field phổ biến vì schema Users có thể đặt tên attribute khác nhau.
+    const splitAttrs = [
+      "Name",
+      "Display Name",
+      "Full Name",
+      "Email",
+      "User principal name",
+      "Username",
+    ];
+
+    let best = { owners: [], rawFetched: 0, successBuckets: 0, attr: "" };
+
+    for (const attrName of splitAttrs) {
+      const result = await fetchOwnersSplitByAttribute(attrName);
+
+      if (result.owners.length > best.owners.length) {
+        best = { ...result, attr: attrName };
+      }
+
+      // Nếu đã lấy gần đủ total thì dừng.
+      if (total > 0 && result.owners.length >= total * 0.98) {
+        best = { ...result, attr: attrName };
+        break;
+      }
+    }
+
+    owners = best.owners;
+
+    console.log(
+      `[ownerMap] split done attr="${best.attr}", total=${total}, unique=${owners.length}, raw=${best.rawFetched}, buckets=${best.successBuckets}`
+    );
+
+    if (total > 0 && owners.length < total) {
+      toast(`⚠ Owner loaded ${owners.length}/${total}. Nếu thiếu user, cần chỉnh split attribute cho Users schema.`, "warning");
+    }
+  }
+
+  owners.forEach(o => rememberOwnerOption(o));
 
   ownerOptionsLoaded = owners.length > 0;
   console.log(`[ownerMap] loaded ${owners.length} owners`);
+
   return owners;
 }
 
