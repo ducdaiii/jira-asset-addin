@@ -65,6 +65,20 @@ const JIRA_COLS = [
 // Cột do user nhập — KHÔNG được ghi đè khi UPDATE
 const USER_COLS = [COL.DAYS, COL.NOTE, COL.CASE_JIRA, COL.ACTION];
 
+// Các cột kỹ thuật nên ẩn bớt cho user khi tạo/ghi sheet.
+// Hide column không ảnh hưởng index nên add-in vẫn chạy bình thường.
+const SYSTEM_HIDDEN_COLS = [
+  COL.OS,           // Operating System
+  COL.OS_VERSION,   // Windows Version
+  COL.OS_BUILD,     // Windows Build
+  COL.CPU,          // CPU
+  COL.IP,           // IP Address
+  COL.NETWORK,      // Network Name
+  COL.ANTIVIRUS,    // Antivirus
+  COL.TENANT_ID,    // Tenant ID / Source ID
+  COL.LANSWEEPER,   // Lansweeper URL
+];
+
 const HEADERS = [
   "Asset ID","Asset Key","Hostname","Serial Number",
   "Status","Location","Region","Manufacturer","Model",
@@ -91,6 +105,11 @@ const CFG_KEYS = {
 
 let cfg      = {};
 let isSyncing = false;
+
+// Audit note: ghi người chỉnh sửa vào cột Note khi user sửa row trong sheet location.
+let auditNoteHandlersRegistered = false;
+let isAuditNoteWriting = false;
+let cachedCurrentUserEmail = "";
 
 // Status attribute trong Jira Assets không phải text.
 // Excel hiển thị tên như "IN USE", nhưng API cần status.id, ví dụ IN USE -> 31.
@@ -222,6 +241,7 @@ Office.onReady(async (info) => {
   wireEvents();
   await refreshDashboard();
   await registerOwnerChangeHandlers();
+  await registerAuditNoteHandlers();
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -813,13 +833,31 @@ async function ensureHeaders(context, sheet) {
   const r = sheet.getRangeByIndexes(0, 0, 1, COL_COUNT);
   r.load("values");
   await context.sync();
-  if (r.values[0][0] === "Asset ID") return;   // đã có header
+  if (r.values[0][0] === "Asset ID") {
+    await hideSystemColumns(context, sheet);
+    return;   // đã có header
+  }
   r.values = [HEADERS];
   r.format.font.bold  = true;
   r.format.fill.color = "#1a1d27";
   r.format.font.color = "#8892a4";
   sheet.freezePanes.freezeRows(1);
+  await hideSystemColumns(context, sheet);
   await context.sync();
+}
+
+async function hideSystemColumns(context, sheet) {
+  // Ẩn cột theo index, không xóa cột.
+  // Add-in vẫn đọc/ghi đúng vì COL map không đổi.
+  SYSTEM_HIDDEN_COLS.forEach(colIdx => {
+    try {
+      sheet.getRangeByIndexes(0, colIdx, 1, 1)
+        .getEntireColumn()
+        .format.columnHidden = true;
+    } catch (e) {
+      console.warn("hideSystemColumns:", e.message || e);
+    }
+  });
 }
 
 // Đọc tất cả data rows (bỏ header)
@@ -838,7 +876,7 @@ async function getLocationSheets(context) {
   context.workbook.worksheets.load("items/name");
   await context.sync();
   return context.workbook.worksheets.items
-    .filter(s => s.name.startsWith("_"))
+    .filter(s => s.name.startsWith("_") && !s.name.startsWith("_SYS_"))
     .map(s => s.name);
 }
 
@@ -977,6 +1015,7 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
 
     const validationUpdates = [];
     const rowsToDeleteBecauseMoved = [];
+    const rowsToDeleteBecauseMissing = [];
 
     if (canFinalMark) {
       existing.forEach((row, idx) => {
@@ -1014,7 +1053,9 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
           return;
         }
 
-        validationUpdates.push({ excelRow: idx + 1, value: "Not in Jira" });
+        // Nếu row không còn trong Jira full sync nữa thì xóa khỏi sheet.
+        // Không áp dụng cho LOCAL vì LOCAL đã được skip ở trên.
+        rowsToDeleteBecauseMissing.push(idx + 1);
       });
 
       for (const u of validationUpdates) {
@@ -1029,14 +1070,18 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
 
       if (validationUpdates.length > 0) await context.sync();
 
-      // Delete stale rows from old location sheets after the correct location sheet has been written.
+      // Delete stale rows from old location sheets or rows removed from Jira.
       // Delete from bottom to top so Excel row indexes do not shift.
-      rowsToDeleteBecauseMoved.sort((a, b) => b - a);
-      for (const excelRow of rowsToDeleteBecauseMoved) {
+      const rowsToDelete = [...new Set([
+        ...rowsToDeleteBecauseMoved,
+        ...rowsToDeleteBecauseMissing,
+      ])].sort((a, b) => b - a);
+
+      for (const excelRow of rowsToDelete) {
         sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT)
           .delete(Excel.DeleteShiftDirection.up);
       }
-      if (rowsToDeleteBecauseMoved.length > 0) await context.sync();
+      if (rowsToDelete.length > 0) await context.sync();
     }
 
     const toInsert = assets.filter(a => {
@@ -1067,11 +1112,15 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
       await context.sync();
     }
 
+    await hideSystemColumns(context, sheet);
+    await context.sync();
+
     const markCount = validationUpdates.filter(x => x.value === "Not in Jira").length;
     const clearCount = validationUpdates.filter(x => x.value === "").length;
     const movedDeleteCount = rowsToDeleteBecauseMoved.length;
+    const missingDeleteCount = rowsToDeleteBecauseMissing.length;
 
-    console.log(`[write] ${sheetName}: update=${updateRows.length}, mark=${markCount}, clear=${clearCount}, movedDelete=${movedDeleteCount}, insert=${toInsert.length}`);
+    console.log(`[write] ${sheetName}: update=${updateRows.length}, mark=${markCount}, clear=${clearCount}, movedDelete=${movedDeleteCount}, missingDelete=${missingDeleteCount}, insert=${toInsert.length}`);
   });
 }
 
@@ -1557,6 +1606,144 @@ async function registerOwnerChangeHandlers() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// AUDIT NOTE: ghi "Standardized by ..." vào cột Note khi user chỉnh row
+// ══════════════════════════════════════════════════════════════
+function decodeJwtPayload(token) {
+  try {
+    const part = String(token || "").split(".")[1];
+    if (!part) return {};
+    const normalized = part.replace(/-/g, "+").replace(/_/g, "/");
+    const json = atob(normalized.padEnd(normalized.length + (4 - normalized.length % 4) % 4, "="));
+    return JSON.parse(json);
+  } catch {
+    return {};
+  }
+}
+
+async function getCurrentUserEmailForAudit() {
+  if (cachedCurrentUserEmail) return cachedCurrentUserEmail;
+
+  // Ưu tiên lấy email Microsoft account đang đăng nhập nếu SSO khả dụng.
+  try {
+    if (OfficeRuntime?.auth?.getAccessToken) {
+      const token = await OfficeRuntime.auth.getAccessToken({ allowSignInPrompt: false });
+      const payload = decodeJwtPayload(token);
+      const email =
+        payload.preferred_username ||
+        payload.upn ||
+        payload.email ||
+        payload.unique_name ||
+        "";
+
+      if (email) {
+        cachedCurrentUserEmail = String(email).trim();
+        return cachedCurrentUserEmail;
+      }
+    }
+  } catch (e) {
+    console.warn("[auditNote] SSO user unavailable, fallback to cfg.email:", e.message || e);
+  }
+
+  // Fallback: email trong Settings. Nếu team dùng chung token thì giá trị này có thể là email Jira config.
+  cachedCurrentUserEmail = String(cfg.email || "unknown-user").trim();
+  return cachedCurrentUserEmail;
+}
+
+function buildAuditNote(userEmail) {
+  const now = new Date().toLocaleString();
+  return `Standardized by ${userEmail} at ${now}`;
+}
+
+function shouldAuditChangedRange(changed) {
+  if (!changed) return false;
+  if (changed.rowIndex === 0) return false; // header
+  if (isSyncing || isAuditNoteWriting) return false;
+
+  const startCol = changed.columnIndex;
+  const endCol = changed.columnIndex + changed.columnCount - 1;
+
+  // Không audit khi chính cột Note/Last Sync/Validation bị ghi để tránh loop.
+  if (startCol <= COL.NOTE && endCol >= COL.NOTE) return false;
+  if (startCol <= COL.LAST_SYNC && endCol >= COL.LAST_SYNC) return false;
+  if (startCol <= COL.VALIDATION && endCol >= COL.VALIDATION) return false;
+
+  // Chỉ audit các thay đổi trong vùng cột của asset.
+  return startCol < COL_COUNT;
+}
+
+async function registerAuditNoteHandlers() {
+  if (auditNoteHandlersRegistered) return;
+
+  try {
+    await Excel.run(async (context) => {
+      const sheets = await getLocationSheets(context);
+
+      for (const sheetName of sheets) {
+        const sheet = context.workbook.worksheets.getItem(sheetName);
+
+        sheet.onChanged.add(async (event) => {
+          try {
+            // Chỉ ghi audit cho thao tác local của user đang mở workbook.
+            // Nếu Excel không trả source thì vẫn xử lý.
+            if (event?.source && String(event.source).toLowerCase() !== "local") return;
+            if (!event?.address) return;
+
+            await Excel.run(async (ctx) => {
+              const ws = ctx.workbook.worksheets.getItem(sheetName);
+              const changed = ws.getRange(event.address);
+              changed.load(["rowIndex", "columnIndex", "rowCount", "columnCount"]);
+              await ctx.sync();
+
+              if (!shouldAuditChangedRange(changed)) return;
+
+              const userEmail = await getCurrentUserEmailForAudit();
+              const noteText = buildAuditNote(userEmail);
+
+              isAuditNoteWriting = true;
+
+              for (let r = 0; r < changed.rowCount; r++) {
+                const absoluteRow = changed.rowIndex + r;
+                if (absoluteRow === 0) continue;
+
+                // Chỉ ghi note nếu row có dữ liệu asset hoặc LOCAL.
+                const rowRange = ws.getRangeByIndexes(absoluteRow, 0, 1, COL_COUNT);
+                rowRange.load("values");
+                await ctx.sync();
+
+                const row = rowRange.values[0] || [];
+                const hasRowData = Boolean(
+                  String(row[COL.ASSET_ID] || "").trim() ||
+                  String(row[COL.ASSET_KEY] || "").trim() ||
+                  String(row[COL.HOSTNAME] || "").trim() ||
+                  String(row[COL.SERIAL] || "").trim() ||
+                  String(row[COL.SYNC_STATUS] || "").trim().toUpperCase() === "LOCAL"
+                );
+
+                if (!hasRowData) continue;
+
+                ws.getRangeByIndexes(absoluteRow, COL.NOTE, 1, 1).values = [[noteText]];
+              }
+
+              await ctx.sync();
+              isAuditNoteWriting = false;
+            });
+          } catch (e) {
+            isAuditNoteWriting = false;
+            console.warn("[auditNote] failed:", e.message || e);
+          }
+        });
+      }
+
+      await context.sync();
+      auditNoteHandlersRegistered = true;
+    });
+  } catch (e) {
+    console.warn("registerAuditNoteHandlers:", e.message || e);
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════════════════════════
 async function refreshDashboard() {
@@ -1712,6 +1899,10 @@ async function createLocationSheets() {
       }
     });
     toast(`Created/verified ${locations.length} location sheet(s)`, "success");
+    auditNoteHandlersRegistered = false;
+    ownerChangeHandlersRegistered = false;
+    await registerAuditNoteHandlers();
+    await registerOwnerChangeHandlers();
     await refreshDashboard();
   } catch(e) { toast("Error: " + e.message, "error"); }
 }
@@ -1818,6 +2009,10 @@ async function runSync() {
     setInner("last-sync-time", formatTime(cfg.lastSync));
 
     toast(`Sync hoàn tất — ${allAssets.length} assets`, "success");
+    auditNoteHandlersRegistered = false;
+    ownerChangeHandlersRegistered = false;
+    await registerAuditNoteHandlers();
+    await registerOwnerChangeHandlers();
     await refreshDashboard();
 
   } catch (e) {
