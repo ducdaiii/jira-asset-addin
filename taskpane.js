@@ -847,17 +847,21 @@ async function ensureHeaders(context, sheet) {
 }
 
 async function hideSystemColumns(context, sheet) {
-  // Ẩn cột theo index, không xóa cột.
-  // Add-in vẫn đọc/ghi đúng vì COL map không đổi.
-  SYSTEM_HIDDEN_COLS.forEach(colIdx => {
-    try {
-      sheet.getRangeByIndexes(0, colIdx, 1, 1)
-        .getEntireColumn()
-        .format.columnHidden = true;
-    } catch (e) {
-      console.warn("hideSystemColumns:", e.message || e);
+    for (const colIdx of SYSTEM_HIDDEN_COLS) {
+        try {
+            const col = sheet.getRangeByIndexes(0, colIdx, 1, 1).getEntireColumn();
+
+            col.columnHidden = true;
+
+            // hoặc:
+            // col.format.columnHidden = true;
+
+        } catch (e) {
+            console.warn("hideSystemColumns:", e);
+        }
     }
-  });
+
+    await context.sync();
 }
 
 // Đọc tất cả data rows (bỏ header)
@@ -970,6 +974,7 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
   await Excel.run(async (context) => {
     const sheet = await ensureSheet(context, sheetName);
     await ensureHeaders(context, sheet);
+    await hideSystemColumns(context, sheet);
 
     const existing = await readSheetRows(context, sheet);
 
@@ -1895,6 +1900,7 @@ async function createLocationSheets() {
       for (const loc of locations) {
         const sheet = await ensureSheet(context, locationSheetName(loc));
         await ensureHeaders(context, sheet);
+        await hideSystemColumns(context, sheet);
         await applyStatusDropdownToSheet(context, sheet);
       }
     });
