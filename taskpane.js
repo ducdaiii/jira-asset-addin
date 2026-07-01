@@ -847,21 +847,27 @@ async function ensureHeaders(context, sheet) {
 }
 
 async function hideSystemColumns(context, sheet) {
-    for (const colIdx of SYSTEM_HIDDEN_COLS) {
-        try {
-            const col = sheet.getRangeByIndexes(0, colIdx, 1, 1).getEntireColumn();
+  // Ẩn cột theo index, không xóa cột.
+  // Add-in vẫn đọc/ghi đúng vì COL map không đổi.
+  // Dùng columnHidden trực tiếp ổn định hơn format.columnHidden trên Excel Online.
+  for (const colIdx of SYSTEM_HIDDEN_COLS) {
+    try {
+      const col = sheet.getRangeByIndexes(0, colIdx, 1, 1).getEntireColumn();
 
-            col.columnHidden = true;
+      // ExcelApi hỗ trợ trực tiếp property columnHidden trên Range.
+      col.columnHidden = true;
 
-            // hoặc:
-            // col.format.columnHidden = true;
+      // Fallback cho một số host cũ.
+      try {
+        col.format.columnHidden = true;
+      } catch (_) {}
 
-        } catch (e) {
-            console.warn("hideSystemColumns:", e);
-        }
+    } catch (e) {
+      console.warn("hideSystemColumns:", e.message || e);
     }
+  }
 
-    await context.sync();
+  await context.sync();
 }
 
 // Đọc tất cả data rows (bỏ header)
@@ -974,7 +980,6 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
   await Excel.run(async (context) => {
     const sheet = await ensureSheet(context, sheetName);
     await ensureHeaders(context, sheet);
-    await hideSystemColumns(context, sheet);
 
     const existing = await readSheetRows(context, sheet);
 
