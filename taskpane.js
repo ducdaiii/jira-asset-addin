@@ -129,6 +129,10 @@ let ownerKeyToObject = {};
 let ownerOptionsLoaded = false;
 let ownerChangeHandlersRegistered = false;
 
+// Cache attribute hợp lệ theo objectTypeId để tránh gửi field không thuộc schema.
+// Ví dụ: một số objectType không có Assigned User attribute 26690.
+const objectTypeAttributeCache = new Map();
+
 function normalizeStatusName(value) {
   return String(value || "")
     .trim()
@@ -2382,24 +2386,90 @@ async function ensureStatusMap() {
   console.log(`[statusMap] loaded ${getCachedStatusNamesArray().length} status: ${listCachedStatusNames()}`);
 }
 
+async 
+async function getObjectTypeIdForAsset(assetId) {
+  const id = String(assetId || "").trim();
+  if (!id) return "";
+
+  try {
+    const data = await assetsGet(`/object/${encodeURIComponent(id)}`);
+    return String(
+      data?.objectType?.id ||
+      data?.objectTypeId ||
+      data?.objectType?.objectTypeId ||
+      ""
+    ).trim();
+  } catch (e) {
+    console.warn(`[schema] cannot read object ${id}:`, e.message || e);
+    return "";
+  }
+}
+
+async function getAllowedAttributeIdsForObjectType(objectTypeId) {
+  const typeId = String(objectTypeId || "").trim();
+  if (!typeId) return null;
+
+  if (objectTypeAttributeCache.has(typeId)) {
+    return objectTypeAttributeCache.get(typeId);
+  }
+
+  try {
+    const data = await assetsGet(`/objecttype/${encodeURIComponent(typeId)}/attributes`);
+
+    const attrs = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.values)
+        ? data.values
+        : Array.isArray(data?.attributes)
+          ? data.attributes
+          : Array.isArray(data?.objectTypeAttributes)
+            ? data.objectTypeAttributes
+            : [];
+
+    const ids = new Set(
+      attrs
+        .map(a => String(a?.id ?? a?.objectTypeAttributeId ?? "").trim())
+        .filter(Boolean)
+    );
+
+    objectTypeAttributeCache.set(typeId, ids);
+    return ids;
+  } catch (e) {
+    console.warn(`[schema] cannot read attributes for objectTypeId=${typeId}:`, e.message || e);
+    return null;
+  }
+}
+
+function filterAttributesByAllowedIds(attributes, allowedIds) {
+  if (!(allowedIds instanceof Set)) return attributes;
+
+  return attributes.filter(a =>
+    allowedIds.has(String(a?.objectTypeAttributeId || "").trim())
+  );
+}
+
 async function jiraAttributesFromFields(fields) {
   const attributes = [];
 
   const addValue = (objectTypeAttributeId, value) => {
     const v = String(value || "").trim();
     if (!v) return;
+
     attributes.push({
-      objectTypeAttributeId,
+      objectTypeAttributeId: Number(objectTypeAttributeId),
       objectAttributeValues: [{ value: v }],
     });
   };
 
-  addValue(1737, fields.hostname); // Hostname
-  addValue(5194, fields.serial);   // Serial Number
-  addValue(30125, fields.location); // Location đang là text theo JSON bạn gửi
-  addValue(5203, fields.purchase);  // Purchase Date, format YYYY-MM-DD
+  // Theo object JSON bạn gửi:
+  // Hostname 1737, Serial Number 5194, Location 30125, Purchase Date 5203.
+  addValue(1737, fields.hostname);
+  addValue(5194, fields.serial);
+  addValue(30125, fields.location);
+  addValue(5203, fields.purchase);
 
-  // Status là kiểu Status, không gửi text. Phải map tên -> status.id.
+  // Status 5052 là status type, không gửi text. Phải map name -> status.id.
+  // Ví dụ In Use -> 31.
   if (fields.status) {
     await ensureStatusMap();
     const statusId = getStatusIdFromCache(fields.status);
@@ -2412,12 +2482,12 @@ async function jiraAttributesFromFields(fields) {
 
     attributes.push({
       objectTypeAttributeId: Number(STATUS_ATTR_ID),
-      objectAttributeValues: [{ value: statusId }],
+      objectAttributeValues: [{ value: String(statusId) }],
     });
   }
 
-  // Assigned User / Owner là reference object.
-  // Không tự tải 13k users trong Update Jira. Chỉ dùng cache từ Refresh Metadata.
+  // Assigned User / Owner 26690 là reference object.
+  // Payload đúng: { referencedObjectBeanId: 82854 }
   if (fields.owner) {
     await ensureOwnerMap(false);
     const owner = getOwnerFromCache(fields.owner);
@@ -2439,8 +2509,25 @@ async function updateJiraAsset(assetId, fields) {
   const id = String(assetId || "").trim();
   if (!id) throw new Error("Action x cần có Asset ID để update");
 
-  const attributes = await jiraAttributesFromFields(fields);
+  let attributes = await jiraAttributesFromFields(fields);
   if (!attributes.length) throw new Error("Không có field nào để update");
+
+  // Object type nào không có attribute nào thì bỏ attribute đó.
+  // Fix lỗi: Object Type Attribute not valid (id: 26690).
+  const objectTypeId = await getObjectTypeIdForAsset(id);
+  const allowedIds = await getAllowedAttributeIdsForObjectType(objectTypeId);
+  const before = attributes.length;
+
+  attributes = filterAttributesByAllowedIds(attributes, allowedIds);
+
+  const skipped = before - attributes.length;
+  if (skipped > 0) {
+    console.warn(`[updateJiraAsset] skipped ${skipped} invalid attribute(s) for asset=${id}, objectTypeId=${objectTypeId}`);
+  }
+
+  if (!attributes.length) {
+    throw new Error(`Không có field hợp lệ để update cho objectTypeId=${objectTypeId || "unknown"}`);
+  }
 
   return assetsPut(`/object/${id}`, { attributes });
 }
@@ -2546,9 +2633,14 @@ async function createJiraAssetFromRow(row) {
     throw new Error("Row mới cần ít nhất Hostname hoặc Serial Number");
   }
 
-  const attributes = await jiraAttributesFromFields(fields);
+  let attributes = await jiraAttributesFromFields(fields);
+
+  // Chỉ gửi attribute hợp lệ cho objectType create mặc định.
+  const allowedIds = await getAllowedAttributeIdsForObjectType(defaultTypeId);
+  attributes = filterAttributesByAllowedIds(attributes, allowedIds);
+
   if (!attributes.length) {
-    throw new Error("Không có field nào để create");
+    throw new Error("Không có field hợp lệ để create");
   }
 
   return assetsPost("/object/create", {
