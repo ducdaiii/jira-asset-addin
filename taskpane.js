@@ -1538,6 +1538,11 @@ async function fetchOwnersFromJira() {
 
     owners = best.owners;
 
+    if (!owners.length) {
+      console.warn("[ownerMap] split returned 0 owner. Fallback to first API_LIMIT users from base query.");
+      owners = await fetchOwnersUnderLimit(baseQ);
+    }
+
     console.log(`[ownerMap] best attr="${best.attr}", total=${total}, unique=${owners.length}, complete=${best.complete}`);
 
     if (total > 0 && owners.length < total) {
@@ -1658,6 +1663,7 @@ async function writeOwnerMetadataSheet(context) {
     o.username || "",
   ]);
 
+  console.log(`[ownerMap] metadata sheet rows=${rows.length}`);
   sheet.getRangeByIndexes(1, 0, rows.length, 4).values = rows;
 
   try { sheet.visibility = Excel.SheetVisibility.hidden; } catch (_) {}
@@ -1684,7 +1690,7 @@ async function applyOwnerDropdownToSheet(context, sheet, ownerSourceRangeFormula
 
 async function applyOwnerDropdownAllSheets() {
   try {
-    await ensureOwnerMap();
+    await ensureOwnerMap(true);
 
     await Excel.run(async (context) => {
       const ownerSource = await writeOwnerMetadataSheet(context);
@@ -1707,34 +1713,73 @@ async function applyOwnerDropdownAllSheets() {
 }
 
 async function refreshMetadataDropdowns() {
-  // Refresh Metadata chỉ tải Status + Owner và áp dụng dropdown.
-  // Không sync asset, không ghi dữ liệu asset.
+  let statusOk = false;
+  let ownerOk = false;
+  let statusErr = "";
+  let ownerErr = "";
+
   try {
     statusOptionsLoaded = false;
     ownerOptionsLoaded = false;
 
-    await ensureStatusMap();
-    await ensureOwnerMap(true);
+    try {
+      await ensureStatusMap();
+      statusOk = true;
+      console.log(`[metadata] Status loaded: ${getCachedStatusNamesArray().length}`);
+    } catch (e) {
+      statusErr = e.message || String(e);
+      console.warn("[metadata] Status load failed, continue Owner:", statusErr);
+      toast("Status lỗi, vẫn tiếp tục load Owner: " + statusErr, "warning");
+    }
+
+    try {
+      await ensureOwnerMap(true);
+      ownerOk = true;
+      console.log(`[metadata] Owner loaded: ${getCachedOwnerNamesArray().length}`);
+    } catch (e) {
+      ownerErr = e.message || String(e);
+      console.warn("[metadata] Owner load failed:", ownerErr);
+      toast("Owner lỗi: " + ownerErr, "warning");
+    }
 
     await Excel.run(async (context) => {
       const sheets = await getLocationSheets(context);
-      const ownerSource = await writeOwnerMetadataSheet(context);
+      let ownerSource = null;
+
+      if (ownerOk) {
+        ownerSource = await writeOwnerMetadataSheet(context);
+      }
 
       for (const sheetName of sheets) {
         const sheet = context.workbook.worksheets.getItem(sheetName);
-        await applyStatusDropdownToSheet(context, sheet);
-        await applyOwnerDropdownToSheet(context, sheet, ownerSource);
+
+        if (statusOk) {
+          await applyStatusDropdownToSheet(context, sheet);
+        }
+
+        if (ownerOk && ownerSource) {
+          await applyOwnerDropdownToSheet(context, sheet, ownerSource);
+        }
       }
 
       await context.sync();
     });
 
-    await registerOwnerChangeHandlers();
+    if (ownerOk) {
+      ownerChangeHandlersRegistered = false;
+      await registerOwnerChangeHandlers();
+    }
 
-    toast(
-      `Refresh Metadata xong: Status=${getCachedStatusNamesArray().length}, Owner=${getCachedOwnerNamesArray().length}`,
-      "success"
-    );
+    const msg = [
+      statusOk ? `Status=${getCachedStatusNamesArray().length}` : `Status=FAILED`,
+      ownerOk ? `Owner=${getCachedOwnerNamesArray().length}` : `Owner=FAILED`,
+    ].join(", ");
+
+    if (statusOk || ownerOk) {
+      toast(`Refresh Metadata xong: ${msg}`, ownerOk ? "success" : "warning");
+    } else {
+      toast(`Refresh Metadata lỗi: Status=${statusErr}; Owner=${ownerErr}`, "error");
+    }
   } catch (e) {
     console.warn("refreshMetadataDropdowns:", e.message || e);
     toast("Refresh Metadata lỗi: " + (e.message || e), "warning");
