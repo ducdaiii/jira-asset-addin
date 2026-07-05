@@ -1566,98 +1566,147 @@ function rememberOwnerListIntoSeen(list, seen) {
 }
 
 
+
+const OWNER_EXTRA_BUCKETS = [
+  ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  ..."abcdefghijklmnopqrstuvwxyz",
+  ..."0123456789",
+  "[", "_", "-", ".", "@"
+];
+
+function ownerRememberToSeen(list, seen) {
+  (list || []).forEach(o => {
+    const k = ownerDedupKey(o);
+    if (k && !seen.has(k)) seen.set(k, o);
+  });
+}
+
+function escapeOwnerAql(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+async function fetchOwnerBucketToSeen(qlQuery, seen, label) {
+  try {
+    const total = await fetchTotalCount(qlQuery);
+    if (!total) return { total: 0, loaded: 0 };
+
+    const list = await fetchOwnersUnderLimit(qlQuery);
+    ownerRememberToSeen(list, seen);
+
+    console.log(`[ownerMap] ${label}: total=${total}, loaded=${list.length}, unique=${seen.size}`);
+    return { total, loaded: list.length };
+  } catch (e) {
+    console.warn(`[ownerMap] ${label} failed:`, e.message || e);
+    return { total: 0, loaded: 0 };
+  }
+}
+
+function ownerAlphaQueries(baseQ, attrName) {
+  const queries = OWNER_EXTRA_BUCKETS.map(ch => ({
+    label: `${attrName} START ${ch}`,
+    qlQuery: `${baseQ} AND "${attrName}" LIKE "${escapeOwnerAql(ch)}%"`,
+  }));
+
+  const notLike = OWNER_EXTRA_BUCKETS
+    .map(ch => `"${attrName}" NOT LIKE "${escapeOwnerAql(ch)}%"`)
+    .join(" AND ");
+
+  queries.push({
+    label: `${attrName} OTHER`,
+    qlQuery: `${baseQ} AND ${notLike}`,
+  });
+
+  return queries;
+}
+
+function ownerContainsQueries(baseQ, attrName) {
+  return OWNER_EXTRA_BUCKETS
+    .filter(ch => /^[A-Za-z0-9]$/.test(ch))
+    .map(ch => ({
+      label: `${attrName} HAS ${ch}`,
+      qlQuery: `${baseQ} AND "${attrName}" LIKE "%${escapeOwnerAql(ch)}%"`,
+    }));
+}
+
+function ownerKeyQueries(baseQ) {
+  const queries = [];
+  for (let d = 0; d <= 9; d++) {
+    queries.push({
+      label: `objectKey AZD-${d}`,
+      qlQuery: `${baseQ} AND objectKey LIKE "AZD-${d}%"`,
+    });
+    queries.push({
+      label: `Key AZD-${d}`,
+      qlQuery: `${baseQ} AND Key LIKE "AZD-${d}%"`,
+    });
+    queries.push({
+      label: `"Key" AZD-${d}`,
+      qlQuery: `${baseQ} AND "Key" LIKE "AZD-${d}%"`,
+    });
+  }
+  return queries;
+}
+
+async function fetchOwnersAlphabetAndAttributeMerge() {
+  const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
+  const total = await fetchTotalCount(baseQ).catch(() => 0);
+  const seen = new Map();
+
+  console.log(`[ownerMap] total Users=${total}`);
+  toast(`Đang tải Owner list: ${total} users`, "warning");
+
+  const attrs = [
+    "Name",
+    "Display Name",
+    "Full Name",
+    "Email",
+    "User principal name",
+    "Username",
+  ];
+
+  for (const attrName of attrs) {
+    for (const q of ownerAlphaQueries(baseQ, attrName)) {
+      await fetchOwnerBucketToSeen(q.qlQuery, seen, q.label);
+      if (total > 0 && seen.size >= total * 0.995) return { owners: [...seen.values()], total };
+    }
+  }
+
+  for (const q of ownerKeyQueries(baseQ)) {
+    await fetchOwnerBucketToSeen(q.qlQuery, seen, q.label);
+    if (total > 0 && seen.size >= total * 0.995) return { owners: [...seen.values()], total };
+  }
+
+  for (const attrName of ["Email", "User principal name", "Username", "Name"]) {
+    for (const q of ownerContainsQueries(baseQ, attrName)) {
+      await fetchOwnerBucketToSeen(q.qlQuery, seen, q.label);
+      if (total > 0 && seen.size >= total * 0.995) return { owners: [...seen.values()], total };
+    }
+  }
+
+  if (!seen.size) {
+    const list = await fetchOwnersUnderLimit(baseQ);
+    ownerRememberToSeen(list, seen);
+  }
+
+  return { owners: [...seen.values()], total };
+}
+
 async function fetchOwnersFromJira() {
   ownerNameToObject = {};
   ownerKeyToObject = {};
   ownerOptionsLoaded = false;
 
-  const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
-  const total = await fetchTotalCount(baseQ).catch(() => 0);
+  const result = await fetchOwnersAlphabetAndAttributeMerge();
+  const owners = result.owners || [];
+  const total = result.total || 0;
 
-  console.log(`[ownerMap] total Users=${total}`);
-  toast(`Đang tải Owner list: ${total} users`, "warning");
-
-  const seen = new Map();
-
-  if (total > 0 && total < API_LIMIT) {
-    const list = await fetchOwnersUnderLimit(baseQ);
-    rememberOwnerListIntoSeen(list, seen);
-  } else {
-    const splitAttrs = [
-      "Name",
-      "Display Name",
-      "Full Name",
-      "Email",
-      "User principal name",
-      "Username",
-    ];
-
-    for (const attrName of splitAttrs) {
-      try {
-        const legacyResult = await fetchOwnersSplitByAttribute(attrName);
-        rememberOwnerListIntoSeen(legacyResult.owners, seen);
-        console.log(`[ownerMap] legacy merge attr="${attrName}", got=${legacyResult.owners.length}, globalUnique=${seen.size}`);
-        if (total > 0 && seen.size >= total * 0.995) break;
-      } catch (e) {
-        console.warn(`[ownerMap] legacy split failed "${attrName}":`, e.message || e);
-      }
-    }
-
-    for (const attrName of splitAttrs) {
-      try {
-        const result = await fetchOwnersRecursiveByAttribute(attrName);
-        rememberOwnerListIntoSeen(result.owners, seen);
-        console.log(`[ownerMap] merge attr="${attrName}", got=${result.owners.length}, globalUnique=${seen.size}`);
-
-        if (total > 0 && seen.size >= total * 0.995) break;
-      } catch (e) {
-        console.warn(`[ownerMap] recursive attr failed "${attrName}":`, e.message || e);
-      }
-    }
-
-    if (total === 0 || seen.size < total * 0.995) {
-      const objectKeyStrategies = [
-        {
-          label: "objectKey AZD-",
-          makeQuery: (prefix) => `${baseQ} AND objectKey LIKE "AZD-${ownerEscapeAqlValue(prefix)}%"`,
-        },
-        {
-          label: "Key AZD-",
-          makeQuery: (prefix) => `${baseQ} AND Key LIKE "AZD-${ownerEscapeAqlValue(prefix)}%"`,
-        },
-        {
-          label: "Object key AZD-",
-          makeQuery: (prefix) => `${baseQ} AND "Object key" LIKE "AZD-${ownerEscapeAqlValue(prefix)}%"`,
-        },
-      ];
-
-      for (const st of objectKeyStrategies) {
-        try {
-          const result = await fetchOwnersByAqlRecursive(st.label, st.makeQuery, "", 0, seen);
-          console.log(`[ownerMap] merge ${st.label}, fetched=${result.fetched}, globalUnique=${seen.size}`);
-
-          if (total > 0 && seen.size >= total * 0.995) break;
-        } catch (e) {
-          console.warn(`[ownerMap] objectKey strategy failed ${st.label}:`, e.message || e);
-        }
-      }
-    }
-
-    if (!seen.size) {
-      console.warn("[ownerMap] split returned 0 owner. Fallback to first API_LIMIT users from base query.");
-      const list = await fetchOwnersUnderLimit(baseQ);
-      rememberOwnerListIntoSeen(list, seen);
-    }
-  }
-
-  const owners = [...seen.values()];
   owners.forEach(o => rememberOwnerOption(o));
 
   ownerOptionsLoaded = owners.length > 0;
   console.log(`[ownerMap] loaded ${owners.length} owners, total=${total}`);
 
   if (total > 0 && owners.length < total) {
-    toast(`⚠ Owner loaded ${owners.length}/${total}. Vẫn chưa đủ, xem console bucket nào bị capped.`, "warning");
+    toast(`⚠ Owner loaded ${owners.length}/${total}. Nếu vẫn thiếu, gửi log [ownerMap] để xem bucket nào lỗi.`, "warning");
   }
 
   return owners;
@@ -1857,14 +1906,8 @@ async function refreshMetadataDropdowns() {
 
       for (const sheetName of sheets) {
         const sheet = context.workbook.worksheets.getItem(sheetName);
-
-        if (statusOk) {
-          await applyStatusDropdownToSheet(context, sheet);
-        }
-
-        if (ownerOk && ownerSource) {
-          await applyOwnerDropdownToSheet(context, sheet, ownerSource);
-        }
+        if (statusOk) await applyStatusDropdownToSheet(context, sheet);
+        if (ownerOk && ownerSource) await applyOwnerDropdownToSheet(context, sheet, ownerSource);
       }
 
       await context.sync();
@@ -1876,15 +1919,11 @@ async function refreshMetadataDropdowns() {
     }
 
     const msg = [
-      statusOk ? `Status=${getCachedStatusNamesArray().length}` : `Status=FAILED`,
-      ownerOk ? `Owner=${getCachedOwnerNamesArray().length}` : `Owner=FAILED`,
+      statusOk ? `Status=${getCachedStatusNamesArray().length}` : "Status=FAILED",
+      ownerOk ? `Owner=${getCachedOwnerNamesArray().length}` : "Owner=FAILED",
     ].join(", ");
 
-    if (statusOk || ownerOk) {
-      toast(`Refresh Metadata xong: ${msg}`, ownerOk ? "success" : "warning");
-    } else {
-      toast(`Refresh Metadata lỗi: Status=${statusErr}; Owner=${ownerErr}`, "error");
-    }
+    toast(`Refresh Metadata xong: ${msg}`, statusOk || ownerOk ? "success" : "error");
   } catch (e) {
     console.warn("refreshMetadataDropdowns:", e.message || e);
     toast("Refresh Metadata lỗi: " + (e.message || e), "warning");
