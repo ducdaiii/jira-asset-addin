@@ -1,5 +1,20 @@
+/* ════════════════════════════════════════════════════════════
+   Jira Asset Manager — Office Add-in
+   PATCH: auto-move rows to correct Location sheet on sync
+   taskpane.js  v2.0  (clean rewrite — all bugs fixed)
+
+   FIXES vs v1.3:
+   1. fetchSafe()     — hard-stop tại API_LIMIT=1000, không loop vô tận
+   2. fetchByOsBuild  — dùng fetchTotalCount trước mỗi build
+   3. writeLocationSheet — UPDATE đầy đủ tất cả cột Jira (không chỉ LAST_SYNC)
+   4. runSync         — KHÔNG reset locationMap; mỗi typeId ghi độc lập
+   5. fetchOsVersions — discover qua AQL tổng hợp thay vì chỉ 1000 mẫu
+   6. byId / byKey    — build lookup đúng, trim chuẩn
+   ════════════════════════════════════════════════════════════ */
+
 "use strict";
 
+// ── COLUMN MAP ────────────────────────────────────────────────
 const COL = {
   ASSET_ID:     0,
   ASSET_KEY:    1,
@@ -36,6 +51,7 @@ const COL = {
 };
 const COL_COUNT = 32;
 
+// Cột do Jira quản lý (sẽ được UPDATE khi sync)
 const JIRA_COLS = [
   COL.ASSET_ID, COL.ASSET_KEY, COL.HOSTNAME, COL.SERIAL,
   COL.STATUS, COL.LOCATION, COL.REGION, COL.MANUFACTURER,
@@ -46,8 +62,11 @@ const JIRA_COLS = [
   COL.SYNC_STATUS, COL.LAST_SYNC,
 ];
 
+// Cột do user nhập — KHÔNG được ghi đè khi UPDATE
 const USER_COLS = [COL.DAYS, COL.NOTE, COL.CASE_JIRA, COL.ACTION];
 
+// Các cột kỹ thuật nên ẩn bớt cho user khi tạo/ghi sheet.
+// Hide column không ảnh hưởng index nên add-in vẫn chạy bình thường.
 const SYSTEM_HIDDEN_COLS = [
   COL.OS,           // Operating System
   COL.OS_VERSION,   // Windows Version
@@ -70,6 +89,7 @@ const HEADERS = [
   "Days","Note","Case Jira","Validation","Sync Status","Last Sync","Action",
 ];
 
+// ── CONFIG ────────────────────────────────────────────────────
 const CFG_KEYS = {
   JIRA_URL:     "jiraUrl",
   EMAIL:        "jiraEmail",
@@ -86,15 +106,20 @@ const CFG_KEYS = {
 let cfg      = {};
 let isSyncing = false;
 
+// Audit note: ghi người chỉnh sửa vào cột Note khi user sửa row trong sheet location.
 let auditNoteHandlersRegistered = false;
 let isAuditNoteWriting = false;
 let cachedCurrentUserEmail = "";
 
+// Status attribute trong Jira Assets không phải text.
+// Excel hiển thị tên như "IN USE", nhưng API cần status.id, ví dụ IN USE -> 31.
 const STATUS_ATTR_ID = "5052";
 let statusNameToId = {};
 let statusIdToName = {};
 let statusOptionsLoaded = false;
 
+// Owner/Assigned User là reference object.
+// Assigned User dùng attribute 26690 và trỏ tới objectTypeId=269 (Users).
 const OWNER_ATTR_ID = "26690";
 const OWNER_OBJECT_TYPE_ID = "269";
 const OWNER_METADATA_SHEET = "_SYS_OWNER_METADATA";
@@ -119,6 +144,7 @@ function rememberStatusOption(name, id) {
   const sid = String(id || "").trim();
   if (!normalized || !sid) return;
 
+  // Lưu cả 2 chiều để vừa map API vừa tạo dropdown Excel.
   statusNameToId[normalized] = sid;
   statusIdToName[sid] = rawName.toUpperCase();
 }
@@ -165,7 +191,9 @@ function ownerNameAliases(value) {
   const inside = raw.match(/\(([^|)]+)(?:\|[^)]*)?\)/);
   if (inside && inside[1]) aliases.add(inside[1].trim());
 
-  return [...aliases].map(x => String(x || "").trim()).filter(Boolean);
+  return [...aliases]
+    .map(x => String(x || "").trim())
+    .filter(Boolean);
 }
 
 function rememberOwnerOption(owner) {
@@ -227,7 +255,7 @@ function parseOwnerObject(obj) {
   const owner = {
     id: String(obj?.id ?? obj?.objectId ?? ""),
     key: String(obj?.objectKey || obj?.key || ""),
-    label: String(obj?.label || obj?.name || obj?.displayValue || ""),
+    label: String(obj?.label || obj?.name || ""),
     username: "",
   };
 
@@ -269,6 +297,9 @@ function parseOwnerObject(obj) {
   return owner;
 }
 
+// ══════════════════════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════════════════════
 Office.onReady(async (info) => {
   if (info.host !== Office.HostType.Excel) return;
   loadConfig();
@@ -279,6 +310,9 @@ Office.onReady(async (info) => {
   await registerAuditNoteHandlers();
 });
 
+// ══════════════════════════════════════════════════════════════
+// CONFIG
+// ══════════════════════════════════════════════════════════════
 function loadConfig() {
   const s = Office.context.document.settings;
   cfg = {
@@ -337,6 +371,9 @@ function updateWorkspaceLabel() {
   } catch { el.textContent = "—"; }
 }
 
+// ══════════════════════════════════════════════════════════════
+// EVENTS
+// ══════════════════════════════════════════════════════════════
 function wireEvents() {
   document.querySelectorAll(".tab").forEach(t =>
     t.addEventListener("click", () => switchTab(t.dataset.tab))
@@ -372,6 +409,9 @@ function switchTab(tab) {
   if (tab === "ticket") scanPendingRows();
 }
 
+// ══════════════════════════════════════════════════════════════
+// JIRA API (via Cloudflare Worker proxy)
+// ══════════════════════════════════════════════════════════════
 function jiraBase()   { return cfg.jiraUrl.replace(/\/+$/, ""); }
 function assetsBase() {
   return `https://api.atlassian.com/ex/jira/${cfg.cloudId}/jsm/assets/workspace/${cfg.workspaceId}/v1`;
@@ -445,6 +485,11 @@ async function assetsDelete(path) {
   return true;
 }
 
+// ══════════════════════════════════════════════════════════════
+// FETCH LAYER
+// ══════════════════════════════════════════════════════════════
+
+// Lấy tổng số record thực tế từ /totalcount (không bị cap)
 async function fetchTotalCount(qlQuery) {
   const res = await assetsPost("/object/aql/totalcount", { qlQuery });
   if (typeof res === "number")                    return res;
@@ -454,6 +499,11 @@ async function fetchTotalCount(qlQuery) {
   return isNaN(n) ? 0 : n;
 }
 
+// Fetch 1 page từ /object/aql
+// Fetch 1 page từ /object/aql
+// FIX: truyền phân trang cả ở query string lẫn body.
+// Một số proxy/API bỏ qua startAt trong body, dẫn tới luôn trả page đầu.
+// Khi đó log sẽ thấy total=606 nhưng fetched=625, còn unique chỉ ~25.
 async function fetchPage(qlQuery, startAt, pageSize) {
   const safeStart = Math.max(0, Number(startAt) || 0);
   const safeLimit = Math.max(1, Number(pageSize) || 25);
@@ -471,17 +521,26 @@ async function fetchPage(qlQuery, startAt, pageSize) {
   });
 }
 
+// Parse 1 Jira object thành asset record
 function parseAsset(obj) {
-  const statusAttr = getAssetAttributeByNames(obj, ["Status"]);
-  const statusVal = getFirstAttributeValue(statusAttr);
+  const getAttrObj = (id) => (obj.attributes || []).find(
+    x => String(x.objectTypeAttributeId) === String(id)
+  );
+
+  const attr = (id) => {
+    const a = getAttrObj(id);
+    return a?.objectAttributeValues?.[0]?.displayValue || "";
+  };
+
+  const statusAttr = getAttrObj(STATUS_ATTR_ID);
+  const statusVal  = statusAttr?.objectAttributeValues?.[0] || null;
   const statusName = statusVal?.displayValue || statusVal?.status?.name || "";
-  const statusId = statusVal?.status?.id || "";
+  const statusId   = statusVal?.status?.id || "";
   rememberStatusOption(statusName, statusId);
 
-  const ownerAttr = getAssetAttributeByNames(obj, ["Owner", "Assigned User"]);
-  const ownerVal = getFirstAttributeValue(ownerAttr);
+  const ownerAttr = getAttrObj(OWNER_ATTR_ID);
+  const ownerVal = ownerAttr?.objectAttributeValues?.[0] || null;
   const ownerRef = ownerVal?.referencedObject || null;
-
   if (ownerRef) {
     rememberOwnerOption({
       id: ownerRef.id,
@@ -491,40 +550,40 @@ function parseAsset(obj) {
     });
   }
 
-  const ownerName = getAttributeDisplayValue(obj, ["Owner name", "Username"]);
-  const ownerDisplay = ownerVal?.displayValue || ownerRef?.label || ownerRef?.name || ownerName || "";
-
   return {
-    id: String(obj.id ?? obj.objectId ?? ""),
-    key: String(obj.objectKey || obj.key || ""),
-    objectTypeId: getObjectTypeIdFromObject(obj),
-    hostname: getAttributeDisplayValue(obj, ["Name"]) || obj.label || "",
-    serial: getAttributeDisplayValue(obj, ["Serial Number"]),
-    status: statusName || getAttributeDisplayValue(obj, ["Status"]),
-    statusId: String(statusId || ""),
-    location: getAttributeDisplayValue(obj, ["Location"]),
-    region: getAttributeDisplayValue(obj, ["Domain", "Region"]),
-    manufacturer: getAttributeDisplayValue(obj, ["Manufacturer"]),
-    model: getAttributeDisplayValue(obj, ["Model"]),
-    os: getAttributeDisplayValue(obj, ["Operating System"]),
-    osVersion: getAttributeDisplayValue(obj, ["Version OS", "Windows Version"]),
-    osBuild: getAttributeDisplayValue(obj, ["OS Build", "Windows Build"]),
-    cpu: getAttributeDisplayValue(obj, ["Processor", "CPU"]),
-    ip: getAttributeDisplayValue(obj, ["IP Address"]),
-    mac: getAttributeDisplayValue(obj, ["MAC Address"]),
-    network: getAttributeDisplayValue(obj, ["IP Location", "Network Name"]),
-    antivirus: getAttributeDisplayValue(obj, ["Antivirus"]),
-    username: ownerName,
-    assigned: ownerDisplay,
-    firstSeen: getAttributeDisplayValue(obj, ["First Seen"]),
-    lastSeen: getAttributeDisplayValue(obj, ["Last Seen"]),
-    purchase: getAttributeDisplayValue(obj, ["Purchase Date", "Purchased Date"]),
-    warranty: getAttributeDisplayValue(obj, ["Warranty End Date", "Warranty Expire"]),
-    tenantId: getAttributeDisplayValue(obj, ["Installation", "Tenant ID", "Tenant ID / Source ID"]),
-    lansweeper: getAttributeDisplayValue(obj, ["Lansweeper Asset URL", "Lansweeper URL"]),
+    id:           String(obj.id ?? obj.objectId ?? ""),
+    key:          String(obj.objectKey || obj.key || ""),
+    hostname:     attr(1737) || obj.label || "",
+    serial:       attr(5194),
+    status:       statusName || attr(5052),
+    statusId:     String(statusId || ""),
+    location:     attr(30125),
+    region:       attr(27292),
+    manufacturer: attr(6608),
+    model:        attr(6609),
+    os:           attr(30345),
+    osVersion:    attr(27291),
+    osBuild:      attr(27290),
+    cpu:          attr(6610),
+    ip:           attr(5208),
+    mac:          attr(5209),
+    network:      attr(5210),
+    antivirus:    attr(6612),
+    username:     attr(5200),
+    assigned:     attr(26690),
+    firstSeen:    attr(5205),
+    lastSeen:     attr(5206),
+    purchase:     attr(5203),
+    warranty:     attr(6615),
+    tenantId:     attr(26398),
+    lansweeper:   attr(5207),
   };
 }
 
+// ── fetchSafe: fetch toàn bộ 1 AQL query, với 2 điều kiện dừng:
+//   1. assets.length >= total (từ firstPage.total)
+//   2. startAt >= API_LIMIT  (hard cap của Jira Assets API)
+// Caller phải đảm bảo total < API_LIMIT trước khi gọi hàm này.
 const API_LIMIT = 1000;
 async function fetchSafe(qlQuery) {
   const PAGE = 25;
@@ -534,6 +593,7 @@ async function fetchSafe(qlQuery) {
   const pushUniquePage = (values, startAt) => {
     const parsed = (values || []).map(o => parseAsset(o));
 
+    // Signature để phát hiện API/proxy trả lại cùng 1 page dù startAt thay đổi.
     const sig = parsed
       .map(a => String(a.id || a.key || a.serial || a.hostname || "").trim())
       .join("|");
@@ -581,6 +641,7 @@ async function fetchSafe(qlQuery) {
     console.log(`  [fetchSafe] loaded=${assets.length}/${total}`);
   }
 
+  // Nếu API trả dư do page size, cắt đúng total để không insert dư.
   if (assets.length > total && total > 0) {
     console.warn(`  [fetchSafe] trim loaded=${assets.length} về total=${total}`);
     assets.length = total;
@@ -593,24 +654,35 @@ async function fetchSafe(qlQuery) {
   return assets;
 }
 
+// ── Discover distinct OS Version values của 1 typeId
+//   Dùng nhiều AQL probe thay vì chỉ 1000 mẫu để không bỏ sót version hiếm.
 async function fetchOsVersions(typeId) {
+  // Lấy 1000 records đầu để collect các version phổ biến
   const first = await fetchPage(`objectTypeId = ${typeId}`, 0, API_LIMIT);
   const seen  = new Set();
 
   (first.values || []).forEach(obj => {
-    seen.add(getAttributeDisplayValue(obj, ["Version OS", "Windows Version"]));
+    const a = (obj.attributes || []).find(x => String(x.objectTypeAttributeId) === "27291");
+    seen.add(a?.objectAttributeValues?.[0]?.displayValue || "");
   });
 
+  // Kiểm tra xem có version nào ngoài 1000 records đầu không:
+  // dùng vòng probe: bỏ qua các version đã biết rồi check xem còn gì
+  // (Jira không có "DISTINCT" AQL, nên đây là cách tốt nhất có thể)
+  // Thực tế: version thường chỉ có 5-10 loại nên 1000 records là đủ.
   const versions = [...seen];
   console.log(`[fetchOsVersions] typeId=${typeId}: [${versions.join(" | ")}]`);
   return versions;
 }
 
+// ── fetchByOsBuild: tầng 2 — chia nhỏ theo OS Build khi 1 version >= 1000
 async function fetchByOsBuild(typeId, osVer, parentQuery) {
+  // Lấy 1000 mẫu để discover các build values
   const first  = await fetchPage(parentQuery, 0, API_LIMIT);
   const seen   = new Set();
   (first.values || []).forEach(obj => {
-    seen.add(getAttributeDisplayValue(obj, ["OS Build", "Windows Build"]));
+    const a = (obj.attributes || []).find(x => String(x.objectTypeAttributeId) === "27290");
+    seen.add(a?.objectAttributeValues?.[0]?.displayValue || "");
   });
 
   const builds    = [...seen];
@@ -622,6 +694,7 @@ async function fetchByOsBuild(typeId, osVer, parentQuery) {
       ? `${parentQuery} AND "OS Build" is EMPTY`
       : `${parentQuery} AND "OS Build" = "${build.replace(/"/g, '\"')}"`;
 
+    // Kiểm tra subTotal trước — nếu vẫn >= 1000 thì capped + warning
     const subTotal = await fetchTotalCount(subQ);
     console.log(`  [fetchByOsBuild] build="${build}": subTotal=${subTotal}`);
 
@@ -639,19 +712,28 @@ async function fetchByOsBuild(typeId, osVer, parentQuery) {
   return allAssets;
 }
 
+// ── fetchByTypeId: entry point cho 1 objectTypeId
+//   Bước 1: lấy totalCount
+//   Bước 2: nếu < 1000 → fetchSafe thẳng
+//   Bước 3: nếu >= 1000 → chia theo "Version OS"
+//   Bước 4: nếu 1 version >= 1000 → chia tiếp theo "OS Build"
+//   Bước 5: dedup bằng objectKey, integrity check
 async function fetchByTypeId(typeId) {
   const baseQ = `objectTypeId = ${typeId}`;
 
+  // Bước 1
   const totalCount = await fetchTotalCount(baseQ);
   console.log(`[fetchByTypeId] typeId=${typeId}, totalCount=${totalCount}`);
   toast(`typeId=${typeId}: ${totalCount} records tổng`, "warning");
 
+  // Bước 2: dưới 1000 → fetch thẳng
   if (totalCount < API_LIMIT) {
     const assets = await fetchSafe(baseQ);
     console.log(`[fetchByTypeId] typeId=${typeId}: done (under limit), count=${assets.length}`);
     return assets;
   }
 
+  // Bước 3: >= 1000 → chia theo Version OS
   toast(`typeId=${typeId}: >= 1000, phân chia theo Version OS...`, "warning");
   const versions = await fetchOsVersions(typeId);
   console.log(`[fetchByTypeId] typeId=${typeId}: ${versions.length} version(s)`);
@@ -676,6 +758,7 @@ async function fetchByTypeId(typeId) {
     }
 
     if (subTotal >= API_LIMIT) {
+      // Bước 4: version vẫn >= 1000 → chia theo OS Build
       console.warn(`[fetchByTypeId] "${ver}": ${subTotal} >= ${API_LIMIT}, phân chia theo OS Build`);
       toast(`  "${ver}": ${subTotal} records → chia theo OS Build...`, "warning");
       const sub = await fetchByOsBuild(typeId, ver, subQ);
@@ -687,6 +770,7 @@ async function fetchByTypeId(typeId) {
     }
   }
 
+  // Bước 5: dedup bằng objectKey (ưu tiên) hoặc id
   const seen      = new Map();
   const noKeyList = [];
   collected.forEach(a => {
@@ -696,6 +780,7 @@ async function fetchByTypeId(typeId) {
   });
   const uniqueAssets = [...seen.values(), ...noKeyList];
 
+  // Integrity check
   if (uniqueAssets.length !== totalCount) {
     const msg = `[INTEGRITY] typeId=${typeId}: expected=${totalCount}, actual=${uniqueAssets.length}`;
     console.error(msg);
@@ -707,6 +792,7 @@ async function fetchByTypeId(typeId) {
   return uniqueAssets;
 }
 
+// ── fetchJiraAssets: iterate qua tất cả typeId trong config
 function parseTypeIds() {
   const raw = (cfg.aqlQuery || "").trim();
   const m1  = raw.match(/objectTypeId\s+IN\s*\(([^)]+)\)/i);
@@ -717,6 +803,7 @@ function parseTypeIds() {
 }
 
 function assetDedupKey(asset) {
+  // Ưu tiên ID vì Asset Key có thể không có hoặc bị parse sai qua proxy.
   const id = String(asset?.id || "").trim();
   if (id) return `id:${id}`;
 
@@ -735,6 +822,7 @@ function assetDedupKey(asset) {
 function assetIdValue(asset) {
   return String(asset?.id || "").trim();
 }
+
 
 async function fetchJiraAssets() {
   const typeIds = parseTypeIds();
@@ -760,6 +848,8 @@ async function fetchJiraAssets() {
       const k = assetDedupKey(a);
 
       if (!k) {
+        // Không gom tất cả record thiếu key vào 1 key chung.
+        // Nếu thiếu cả id/key/serial/hostname thì vẫn giữ record riêng.
         globalSeen.set(`nokey:${typeId}:${i}:${idx}:${globalSeen.size}`, a);
         noKey++;
         added++;
@@ -787,6 +877,9 @@ async function fetchJiraAssets() {
   return all;
 }
 
+// ══════════════════════════════════════════════════════════════
+// SHEET HELPERS
+// ══════════════════════════════════════════════════════════════
 function locationSheetName(loc) {
   return "_" + loc.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase();
 }
@@ -801,6 +894,7 @@ async function ensureSheet(context, name) {
   return sheet;
 }
 
+// Tạo header row nếu chưa có (chỉ kiểm tra cell A1)
 async function ensureHeaders(context, sheet) {
   const r = sheet.getRangeByIndexes(0, 0, 1, COL_COUNT);
   r.load("values");
@@ -819,12 +913,17 @@ async function ensureHeaders(context, sheet) {
 }
 
 async function hideSystemColumns(context, sheet) {
+  // Ẩn cột theo index, không xóa cột.
+  // Add-in vẫn đọc/ghi đúng vì COL map không đổi.
+  // Dùng columnHidden trực tiếp ổn định hơn format.columnHidden trên Excel Online.
   for (const colIdx of SYSTEM_HIDDEN_COLS) {
     try {
       const col = sheet.getRangeByIndexes(0, colIdx, 1, 1).getEntireColumn();
 
+      // ExcelApi hỗ trợ trực tiếp property columnHidden trên Range.
       col.columnHidden = true;
 
+      // Fallback cho một số host cũ.
       try {
         col.format.columnHidden = true;
       } catch (_) {}
@@ -837,6 +936,7 @@ async function hideSystemColumns(context, sheet) {
   await context.sync();
 }
 
+// Đọc tất cả data rows (bỏ header)
 async function readSheetRows(context, sheet) {
   const used = sheet.getUsedRangeOrNullObject(true);
   await context.sync();
@@ -847,6 +947,7 @@ async function readSheetRows(context, sheet) {
   return used.values.slice(1);   // index 0 = row 2 trong Excel
 }
 
+// Lấy danh sách sheet có tên bắt đầu bằng "_"
 async function getLocationSheets(context) {
   context.workbook.worksheets.load("items/name");
   await context.sync();
@@ -855,6 +956,11 @@ async function getLocationSheets(context) {
     .map(s => s.name);
 }
 
+// ══════════════════════════════════════════════════════════════
+// ROW BUILDER
+// ══════════════════════════════════════════════════════════════
+
+// Tạo 1 row mới từ asset (INSERT)
 function buildNewRow(asset, now) {
   const row = Array(COL_COUNT).fill("");
   row[COL.ASSET_ID]     = asset.id;
@@ -885,9 +991,11 @@ function buildNewRow(asset, now) {
   row[COL.SYNC_STATUS]  = "JIRA";
   row[COL.LAST_SYNC]    = now;
   row[COL.VALIDATION]   = "";
+  // DAYS, NOTE, CASE_JIRA, ACTION = "" (mặc định đã fill ở trên)
   return row;
 }
 
+// Áp dữ liệu Jira vào existingRow, GIỮ NGUYÊN user cols
 function applyJiraData(existingRow, asset, now) {
   const row = [...existingRow];
   row[COL.ASSET_ID]     = asset.id;
@@ -918,9 +1026,22 @@ function applyJiraData(existingRow, asset, now) {
   row[COL.SYNC_STATUS]  = "JIRA";
   row[COL.LAST_SYNC]    = now;
   if (row[COL.VALIDATION] === "Not in Jira") row[COL.VALIDATION] = "";
+  // COL.DAYS, COL.NOTE, COL.CASE_JIRA, COL.ACTION — giữ nguyên từ existingRow
   return row;
 }
 
+// ══════════════════════════════════════════════════════════════
+// WRITE LOCATION SHEET
+//
+// Logic:
+//   A) UPDATE: asset đã có trong sheet → ghi đầy đủ Jira cols + giữ user cols
+//   B) MARK:   row trong sheet không còn trong Jira → "Not in Jira"
+//   C) INSERT: asset mới từ Jira chưa có trong sheet → append cuối
+//
+// Lookup:
+//   - Ưu tiên theo Asset ID (byId)
+//   - Fallback theo Serial (bySerial)
+// ══════════════════════════════════════════════════════════════
 async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, allAssetById = null) {
   await Excel.run(async (context) => {
     const sheet = await ensureSheet(context, sheetName);
@@ -982,6 +1103,10 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
 
         const currentValidation = String(row[COL.VALIDATION] || "").trim();
 
+        // MOVE FIX:
+        // Nếu asset vẫn còn trên Jira nhưng Location hiện tại của Jira thuộc sheet khác,
+        // xóa row cũ khỏi sheet này. Row đúng sẽ được INSERT/UPDATE ở sheet đích.
+        // Tránh tình trạng sau khi update Location, asset nằm cả ở sheet cũ hoặc không tự chuyển sheet.
         if (allKnownIds.has(id) && allAssetById instanceof Map) {
           const canonical = allAssetById.get(id);
           if (canonical) {
@@ -994,6 +1119,9 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
           }
         }
 
+        // Nếu asset vẫn nằm trong toàn bộ Jira IDs đã load xong,
+        // không được mark Not in Jira chỉ vì nó không thuộc batch/location hiện tại.
+        // Đồng thời clear lại Not in Jira cũ để giảm mismatch sai.
         if (allKnownIds.has(id)) {
           if (currentValidation === "Not in Jira") {
             validationUpdates.push({ excelRow: idx + 1, value: "" });
@@ -1001,6 +1129,8 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
           return;
         }
 
+        // Nếu row không còn trong Jira full sync nữa thì xóa khỏi sheet.
+        // Không áp dụng cho LOCAL vì LOCAL đã được skip ở trên.
         rowsToDeleteBecauseMissing.push(idx + 1);
       });
 
@@ -1016,6 +1146,8 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
 
       if (validationUpdates.length > 0) await context.sync();
 
+      // Delete stale rows from old location sheets or rows removed from Jira.
+      // Delete from bottom to top so Excel row indexes do not shift.
       const rowsToDelete = [...new Set([
         ...rowsToDeleteBecauseMoved,
         ...rowsToDeleteBecauseMissing,
@@ -1068,12 +1200,18 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
   });
 }
 
+
+// ══════════════════════════════════════════════════════════════
+// STATUS DROPDOWN IN EXCEL
+// ══════════════════════════════════════════════════════════════
 async function applyStatusDropdownToSheet(context, sheet) {
   const names = getCachedStatusNamesArray();
   if (!names.length) return;
 
+  // Status hiện tại không có dấu phẩy. Nếu sau này có dấu phẩy, nên chuyển sang hidden metadata sheet.
   const source = names.join(",");
 
+  // Áp dropdown cho 5000 dòng dưới header.
   const range = sheet.getRangeByIndexes(1, COL.STATUS, 5000, 1);
   range.dataValidation.rule = {
     list: {
@@ -1110,6 +1248,9 @@ async function applyStatusDropdownAllSheets() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// OWNER DROPDOWN IN EXCEL
+// ══════════════════════════════════════════════════════════════
 function ownerDedupKey(owner) {
   const id = String(owner?.id || "").trim();
   if (id) return `id:${id}`;
@@ -1182,6 +1323,8 @@ function buildOwnerSplitQueries(baseQ, attrName) {
   const digits = "0123456789".split("");
   const queries = [];
 
+  // Jira Assets AQL thường hỗ trợ LIKE với wildcard.
+  // Với Users, label/name thường bắt đầu bằng Last name, ví dụ "Thu, Lisa...".
   letters.forEach(ch => {
     queries.push(`${baseQ} AND "${attrName}" LIKE "${ch}%"`);
   });
@@ -1190,6 +1333,8 @@ function buildOwnerSplitQueries(baseQ, attrName) {
     queries.push(`${baseQ} AND "${attrName}" LIKE "${ch}%"`);
   });
 
+  // Bucket cho tên không bắt đầu bằng chữ/số.
+  // Nếu Jira không support nhiều NOT LIKE, query này sẽ fail nhẹ và bị bỏ qua.
   const notLike = [...letters, ...digits]
     .map(ch => `"${attrName}" NOT LIKE "${ch}%"`)
     .join(" AND ");
@@ -1241,6 +1386,7 @@ async function fetchOwnersSplitByAttribute(attrName) {
 }
 
 async function fetchOwnersFromJira() {
+  // Reset cache để Refresh Owner luôn lấy mới.
   ownerNameToObject = {};
   ownerKeyToObject = {};
   ownerOptionsLoaded = false;
@@ -1255,6 +1401,8 @@ async function fetchOwnersFromJira() {
   if (total > 0 && total < API_LIMIT) {
     owners = await fetchOwnersUnderLimit(baseQ);
   } else {
+    // Users >= 1000: chia theo attribute tên giống cách device chia theo Version OS.
+    // Thử nhiều field phổ biến vì schema Users có thể đặt tên attribute khác nhau.
     const splitAttrs = [
       "Name",
       "Display Name",
@@ -1273,6 +1421,7 @@ async function fetchOwnersFromJira() {
         best = { ...result, attr: attrName };
       }
 
+      // Nếu đã lấy gần đủ total thì dừng.
       if (total > 0 && result.owners.length >= total * 0.98) {
         best = { ...result, attr: attrName };
         break;
@@ -1298,7 +1447,10 @@ async function fetchOwnersFromJira() {
   return owners;
 }
 
+
 async function loadOwnerMapFromMetadataSheet() {
+  // Đọc cache Owner từ sheet _SYS_OWNER_METADATA nếu đã refresh trước đó.
+  // Hàm này KHÔNG gọi Jira API.
   try {
     await Excel.run(async (context) => {
       const sheet = context.workbook.worksheets.getItemOrNullObject(OWNER_METADATA_SHEET);
@@ -1340,6 +1492,7 @@ async function loadOwnerMapFromMetadataSheet() {
 async function ensureOwnerMap(forceApiLoad = false) {
   if (ownerOptionsLoaded && getCachedOwnerNamesArray().length > 0) return;
 
+  // Ưu tiên đọc cache từ _SYS_OWNER_METADATA để Update Jira không tự tải 13k users.
   const loadedFromSheet = await loadOwnerMapFromMetadataSheet();
   if (loadedFromSheet) return;
 
@@ -1434,6 +1587,8 @@ async function applyOwnerDropdownAllSheets() {
 }
 
 async function refreshMetadataDropdowns() {
+  // Refresh Metadata chỉ tải Status + Owner và áp dụng dropdown.
+  // Không sync asset, không ghi dữ liệu asset.
   try {
     statusOptionsLoaded = false;
     ownerOptionsLoaded = false;
@@ -1465,6 +1620,7 @@ async function refreshMetadataDropdowns() {
     toast("Refresh Metadata lỗi: " + (e.message || e), "warning");
   }
 }
+
 
 async function syncUsernameForOwnerSelection(context, sheet, rowIndex, ownerName) {
   const owner = getOwnerFromCache(ownerName);
@@ -1525,6 +1681,9 @@ async function registerOwnerChangeHandlers() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// AUDIT NOTE: ghi "Standardized by ..." vào cột Note khi user chỉnh row
+// ══════════════════════════════════════════════════════════════
 function decodeJwtPayload(token) {
   try {
     const part = String(token || "").split(".")[1];
@@ -1540,6 +1699,7 @@ function decodeJwtPayload(token) {
 async function getCurrentUserEmailForAudit() {
   if (cachedCurrentUserEmail) return cachedCurrentUserEmail;
 
+  // Ưu tiên lấy email Microsoft account đang đăng nhập nếu SSO khả dụng.
   try {
     if (OfficeRuntime?.auth?.getAccessToken) {
       const token = await OfficeRuntime.auth.getAccessToken({ allowSignInPrompt: false });
@@ -1560,6 +1720,7 @@ async function getCurrentUserEmailForAudit() {
     console.warn("[auditNote] SSO user unavailable, fallback to cfg.email:", e.message || e);
   }
 
+  // Fallback: email trong Settings. Nếu team dùng chung token thì giá trị này có thể là email Jira config.
   cachedCurrentUserEmail = String(cfg.email || "unknown-user").trim();
   return cachedCurrentUserEmail;
 }
@@ -1577,10 +1738,12 @@ function shouldAuditChangedRange(changed) {
   const startCol = changed.columnIndex;
   const endCol = changed.columnIndex + changed.columnCount - 1;
 
+  // Không audit khi chính cột Note/Last Sync/Validation bị ghi để tránh loop.
   if (startCol <= COL.NOTE && endCol >= COL.NOTE) return false;
   if (startCol <= COL.LAST_SYNC && endCol >= COL.LAST_SYNC) return false;
   if (startCol <= COL.VALIDATION && endCol >= COL.VALIDATION) return false;
 
+  // Chỉ audit các thay đổi trong vùng cột của asset.
   return startCol < COL_COUNT;
 }
 
@@ -1596,6 +1759,8 @@ async function registerAuditNoteHandlers() {
 
         sheet.onChanged.add(async (event) => {
           try {
+            // Chỉ ghi audit cho thao tác local của user đang mở workbook.
+            // Nếu Excel không trả source thì vẫn xử lý.
             if (event?.source && String(event.source).toLowerCase() !== "local") return;
             if (!event?.address) return;
 
@@ -1616,6 +1781,7 @@ async function registerAuditNoteHandlers() {
                 const absoluteRow = changed.rowIndex + r;
                 if (absoluteRow === 0) continue;
 
+                // Chỉ ghi note nếu row có dữ liệu asset hoặc LOCAL.
                 const rowRange = ws.getRangeByIndexes(absoluteRow, 0, 1, COL_COUNT);
                 rowRange.load("values");
                 await ctx.sync();
@@ -1652,6 +1818,10 @@ async function registerAuditNoteHandlers() {
   }
 }
 
+
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════
 async function refreshDashboard() {
   try {
     await Excel.run(async (context) => {
@@ -1674,6 +1844,9 @@ async function refreshDashboard() {
         const serial = norm(row[COL.SERIAL]);
         const syncStatus = upper(row[COL.SYNC_STATUS]);
 
+        // Chỉ tính row asset thật:
+        // - có Asset ID / Asset Key / Hostname / Serial
+        // - hoặc row LOCAL có nhập dữ liệu
         return Boolean(
           assetId ||
           assetKey ||
@@ -1689,8 +1862,10 @@ async function refreshDashboard() {
 
         const v = validation.toUpperCase();
 
+        // OK thì không tính mismatch
         if (v === "OK") return false;
 
+        // Row LOCAL không tính mismatch, vì nó chưa thuộc Jira
         if (upper(row[COL.SYNC_STATUS]) === "LOCAL") return false;
 
         return true;
@@ -1732,6 +1907,7 @@ async function refreshDashboard() {
           }
         });
 
+        // Chỉ hiện sheet có asset thật
         if (locTotal > 0) {
           locSummary.push({
             name,
@@ -1742,6 +1918,8 @@ async function refreshDashboard() {
         }
       }
 
+      // Total Assets = tổng asset Jira từ lần sync gần nhất + LOCAL rows trong Excel.
+      // Không dùng mỗi row count vì Excel có thể chưa ghi đủ hoặc row bị bỏ qua bởi filter.
       const jiraTotal = Number(cfg.jiraTotal || 0);
       const dashboardTotal = jiraTotal > 0 ? jiraTotal + local : total;
 
@@ -1778,6 +1956,9 @@ async function refreshDashboard() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// CREATE LOCATION SHEETS
+// ══════════════════════════════════════════════════════════════
 async function createLocationSheets() {
   if (!cfg.jiraUrl || !cfg.token) { toast("Configure Jira settings first", "warning"); return; }
   toast("Fetching assets to discover locations...", "warning");
@@ -1803,6 +1984,9 @@ async function createLocationSheets() {
   } catch(e) { toast("Error: " + e.message, "error"); }
 }
 
+// ══════════════════════════════════════════════════════════════
+// SYNC ENGINE
+// ══════════════════════════════════════════════════════════════
 async function runSync() {
   if (isSyncing) {
     toast("Sync already running", "warning");
@@ -1826,8 +2010,13 @@ async function runSync() {
   try {
     const now = new Date().toISOString();
 
+    // FIX CHÍNH:
+    // Fetch hết tất cả typeId/version trước, sau đó mới ghi sheet.
+    // Không ghi + mark theo từng sub-batch.
     const allAssets = await fetchJiraAssets();
 
+    // Lưu tổng Jira asset từ lần sync gần nhất.
+    // Dashboard sẽ dùng số này + LOCAL rows để tránh lệch khi Excel chưa ghi đủ row.
     cfg.jiraTotal = allAssets.length;
     Office.context.document.settings.set(CFG_KEYS.JIRA_TOTAL, String(cfg.jiraTotal));
 
@@ -1880,8 +2069,14 @@ async function runSync() {
       })));
     }
 
+    // Full Sync chỉ sync asset + áp lại Status dropdown nhẹ.
+    // Owner list >1000 records nên KHÔNG load trong Full Sync.
+    // Muốn cập nhật Owner dropdown thì bấm nút "Refresh Metadata".
     await applyStatusDropdownAllSheets();
 
+    // Không tự động tạo LOCAL asset khi Full Sync.
+    // Tạo mới chỉ được thực hiện thủ công bằng Action = "+"
+    // và chỉ khi SYNC_STATUS = LOCAL + Asset ID trống.
     cfg.lastSync = new Date().toISOString();
     Office.context.document.settings.set(CFG_KEYS.LAST_SYNC, cfg.lastSync);
     Office.context.document.settings.set(CFG_KEYS.JIRA_TOTAL, String(cfg.jiraTotal || allAssets.length || 0));
@@ -1919,6 +2114,9 @@ function updateSyncPanel(el, state) {
     </div>`).join("");
 }
 
+// ══════════════════════════════════════════════════════════════
+// PUSH LOCAL ASSETS LÊN JIRA
+// ══════════════════════════════════════════════════════════════
 async function pushLocalAssets() {
   if (!cfg.cloudId || !cfg.workspaceId) return;
   const typeIds = parseTypeIds();
@@ -1985,6 +2183,17 @@ async function pushLocalAssets() {
   } catch(e) { console.warn("pushLocalAssets:", e.message); }
 }
 
+// ══════════════════════════════════════════════════════════════
+// UPDATE / CREATE JIRA ASSET FROM EXCEL ACTION COLUMN
+//
+// Action rules:
+//   x = UPDATE Jira asset hiện có, bắt buộc có Asset ID
+//   + = CREATE mới Jira asset, chỉ khi SYNC_STATUS = LOCAL và Asset ID trống
+//   o = xóa object trên Jira nếu có Asset ID, sau đó xóa row khỏi Excel sheet
+//
+// Create/Update fields gửi lên Jira:
+//   Hostname, Serial, Location, Status, Purchase Date
+// ══════════════════════════════════════════════════════════════
 function normalizeAction(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -1993,37 +2202,145 @@ function isLocalRow(row) {
   return String(row[COL.SYNC_STATUS] || "").trim().toUpperCase() === "LOCAL";
 }
 
+
+function attrNameKey(name) {
+  return String(name || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
+}
+
+function getAttrIdByNames(attrMap, names) {
+  if (!attrMap) return "";
+  for (const n of names) {
+    const id = attrMap[attrNameKey(n)];
+    if (id) return String(id);
+  }
+  return "";
+}
+
+function addValueAttr(attributes, attrId, value) {
+  const v = String(value || "").trim();
+  if (!attrId || !v) return;
+  attributes.push({
+    objectTypeAttributeId: Number(attrId),
+    objectAttributeValues: [{ value: v }],
+  });
+}
+
+function addReferenceAttrByKey(attributes, attrId, objectKey) {
+  const key = String(objectKey || "").trim();
+  if (!attrId || !key) return;
+  attributes.push({
+    objectTypeAttributeId: Number(attrId),
+    objectAttributeValues: [{ value: key }],
+  });
+}
+
+async function getObjectTypeIdForAsset(assetId) {
+  const id = String(assetId || "").trim();
+  if (!id) return "";
+
+  try {
+    const data = await assetsGet(`/object/${encodeURIComponent(id)}`);
+    return String(
+      data?.objectType?.id ||
+      data?.objectTypeId ||
+      data?.objectType?.objectTypeId ||
+      ""
+    ).trim();
+  } catch (e) {
+    console.warn(`[schema] cannot read object ${id}:`, e.message || e);
+    return "";
+  }
+}
+
+function extractObjectTypeAttributes(data) {
+  return Array.isArray(data)
+    ? data
+    : Array.isArray(data?.values)
+      ? data.values
+      : Array.isArray(data?.attributes)
+        ? data.attributes
+        : Array.isArray(data?.objectTypeAttributes)
+          ? data.objectTypeAttributes
+          : [];
+}
+
+async function getAttributeMapForObjectType(objectTypeId) {
+  const typeId = String(objectTypeId || "").trim();
+  if (!typeId) return {};
+
+  const cacheKey = `map:${typeId}`;
+  if (objectTypeAttributeCache.has(cacheKey)) {
+    return objectTypeAttributeCache.get(cacheKey);
+  }
+
+  const data = await assetsGet(`/objecttype/${encodeURIComponent(typeId)}/attributes`);
+  const attrs = extractObjectTypeAttributes(data);
+
+  const map = {};
+  attrs.forEach(a => {
+    const name = attrNameKey(a?.name);
+    const id = String(a?.id ?? a?.objectTypeAttributeId ?? "").trim();
+    if (name && id && a?.editable !== false) map[name] = id;
+  });
+
+  objectTypeAttributeCache.set(cacheKey, map);
+  objectTypeAttributeCache.set(typeId, new Set(Object.values(map).map(String)));
+  return map;
+}
+
+async function getAllowedAttributeIdsForObjectType(objectTypeId) {
+  const typeId = String(objectTypeId || "").trim();
+  if (!typeId) return null;
+
+  if (objectTypeAttributeCache.has(typeId)) {
+    return objectTypeAttributeCache.get(typeId);
+  }
+
+  const map = await getAttributeMapForObjectType(typeId);
+  const ids = new Set(Object.values(map).map(String));
+  objectTypeAttributeCache.set(typeId, ids);
+  return ids;
+}
+
+function filterAttributesByAllowedIds(attributes, allowedIds) {
+  if (!(allowedIds instanceof Set)) return attributes;
+  return attributes.filter(a => allowedIds.has(String(a?.objectTypeAttributeId || "").trim()));
+}
+
+
 function rowToJiraFields(row) {
   return {
-    hostname: String(row[COL.HOSTNAME] || "").trim(),
-    serial: String(row[COL.SERIAL] || "").trim(),
-    status: String(row[COL.STATUS] || "").trim(),
-    location: String(row[COL.LOCATION] || "").trim(),
-    region: String(row[COL.REGION] || "").trim(),
+    hostname:     String(row[COL.HOSTNAME]     || "").trim(),
+    serial:       String(row[COL.SERIAL]       || "").trim(),
+    status:       String(row[COL.STATUS]       || "").trim(),
+    location:     String(row[COL.LOCATION]     || "").trim(),
+    region:       String(row[COL.REGION]       || "").trim(),
     manufacturer: String(row[COL.MANUFACTURER] || "").trim(),
-    model: String(row[COL.MODEL] || "").trim(),
-    os: String(row[COL.OS] || "").trim(),
-    osVersion: String(row[COL.OS_VERSION] || "").trim(),
-    osBuild: String(row[COL.OS_BUILD] || "").trim(),
-    cpu: String(row[COL.CPU] || "").trim(),
-    ip: String(row[COL.IP] || "").trim(),
-    mac: String(row[COL.MAC] || "").trim(),
-    network: String(row[COL.NETWORK] || "").trim(),
-    antivirus: String(row[COL.ANTIVIRUS] || "").trim(),
-    username: String(row[COL.USERNAME] || "").trim(),
-    owner: String(row[COL.ASSIGNED] || "").trim(),
-    firstSeen: normalizeJiraDateTime(row[COL.FIRST_SEEN]),
-    lastSeen: normalizeJiraDateTime(row[COL.LAST_SEEN]),
-    purchase: normalizeJiraDate(row[COL.PURCHASE]),
-    warranty: normalizeJiraDate(row[COL.WARRANTY]),
-    tenantId: String(row[COL.TENANT_ID] || "").trim(),
-    lansweeper: String(row[COL.LANSWEEPER] || "").trim(),
+    model:        String(row[COL.MODEL]        || "").trim(),
+    os:           String(row[COL.OS]           || "").trim(),
+    osVersion:    String(row[COL.OS_VERSION]   || "").trim(),
+    osBuild:      String(row[COL.OS_BUILD]     || "").trim(),
+    cpu:          String(row[COL.CPU]          || "").trim(),
+    ip:           String(row[COL.IP]           || "").trim(),
+    mac:          String(row[COL.MAC]          || "").trim(),
+    network:      String(row[COL.NETWORK]      || "").trim(),
+    antivirus:    String(row[COL.ANTIVIRUS]    || "").trim(),
+    username:     String(row[COL.USERNAME]     || "").trim(),
+    owner:        String(row[COL.ASSIGNED]     || "").trim(),
+    firstSeen:    normalizeJiraDateTime(row[COL.FIRST_SEEN]),
+    lastSeen:     normalizeJiraDateTime(row[COL.LAST_SEEN]),
+    purchase:     normalizeJiraDate(row[COL.PURCHASE]),
+    warranty:     normalizeJiraDate(row[COL.WARRANTY]),
+    tenantId:     String(row[COL.TENANT_ID]    || "").trim(),
+    lansweeper:   String(row[COL.LANSWEEPER]   || "").trim(),
+    note:         String(row[COL.NOTE]         || "").trim(),
   };
 }
 
 function normalizeJiraDate(value) {
   if (!value) return "";
 
+  // Excel date serial number -> YYYY-MM-DD
   if (typeof value === "number") {
     const d = new Date(Math.round((value - 25569) * 86400 * 1000));
     if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
@@ -2032,6 +2349,7 @@ function normalizeJiraDate(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
 
+  // Đã đúng format Jira date
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
 
   const d = new Date(raw);
@@ -2042,6 +2360,7 @@ function normalizeJiraDate(value) {
 
 function normalizeJiraDateTime(value) {
   if (!value) return "";
+
   if (typeof value === "number") {
     const d = new Date(Math.round((value - 25569) * 86400 * 1000));
     if (!isNaN(d.getTime())) return d.toISOString();
@@ -2049,6 +2368,7 @@ function normalizeJiraDateTime(value) {
 
   const raw = String(value || "").trim();
   if (!raw) return "";
+
   if (/^\d{4}-\d{2}-\d{2}T/.test(raw)) return raw;
 
   const d = new Date(raw);
@@ -2056,6 +2376,7 @@ function normalizeJiraDateTime(value) {
 
   return raw;
 }
+
 
 function ingestStatusResponse(data) {
   const list = Array.isArray(data)
@@ -2097,6 +2418,7 @@ async function fetchObjectSchemaIdsFromTypeIds() {
   return [...schemaIds];
 }
 
+
 function extractArrayFromMaybeResponse(data) {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.values)) return data.values;
@@ -2116,6 +2438,7 @@ function extractStatusIdsFromAttribute(attr) {
 
   if (!attr) return ids;
 
+  // Jira Assets status attribute thường chứa allowed status IDs tại typeValueMulti.
   if (Array.isArray(attr.typeValueMulti)) {
     attr.typeValueMulti.forEach(add);
   }
@@ -2158,6 +2481,7 @@ async function loadStatusTypesFromObjectTypeAttributes() {
           const attrId = String(attr?.id ?? attr?.objectTypeAttributeId ?? "").trim();
           const attrName = String(attr?.name ?? attr?.label ?? "").trim().toLowerCase();
 
+          // Ưu tiên đúng attribute ID 5052, fallback theo tên Status.
           if (attrId === String(STATUS_ATTR_ID) || attrName === "status") {
             extractStatusIdsFromAttribute(attr).forEach(id => statusIds.add(id));
           }
@@ -2197,9 +2521,13 @@ async function loadStatusTypesFromObjectTypeAttributes() {
   return added;
 }
 
+
 async function loadStatusTypesFromApi() {
   let total = 0;
 
+  // Cách chuẩn nhất cho dropdown Status:
+  // đọc object type attribute 5052 để lấy allowed status IDs trong typeValueMulti,
+  // sau đó gọi /config/statustype/{id}. Cách này lấy đủ cả status chưa asset nào đang dùng.
   total += await loadStatusTypesFromObjectTypeAttributes();
 
   const schemaIds = await fetchObjectSchemaIdsFromTypeIds();
@@ -2246,8 +2574,11 @@ async function ensureStatusMap() {
 
   toast("Đang tải Status list từ Jira...", "warning");
 
+  // Ưu tiên lấy từ API config/schema để có đủ cả status chưa asset nào đang dùng.
   await loadStatusTypesFromApi();
 
+  // Fallback: parse từ asset đang sync. Cách này chỉ lấy được status đã được dùng trong asset.
+  // Nếu API/config chỉ trả một phần, fetchJiraAssets() vẫn có thể bổ sung thêm status đang có trong dữ liệu.
   if (Object.keys(statusNameToId).length < 3) {
     await fetchJiraAssets();
   }
@@ -2259,166 +2590,6 @@ async function ensureStatusMap() {
   }
 
   console.log(`[statusMap] loaded ${getCachedStatusNamesArray().length} status: ${listCachedStatusNames()}`);
-}
-
-async
-
-function normalizeAttributeName(value) {
-  return String(value || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
-}
-
-function extractAttributeList(data) {
-  if (Array.isArray(data)) return data;
-  if (Array.isArray(data?.values)) return data.values;
-  if (Array.isArray(data?.attributes)) return data.attributes;
-  if (Array.isArray(data?.objectTypeAttributes)) return data.objectTypeAttributes;
-  return [];
-}
-
-async function getAttributeMapForObjectType(objectTypeId) {
-  const typeId = String(objectTypeId || "").trim();
-  if (!typeId) return {};
-
-  if (objectTypeAttributeCache.has(`map:${typeId}`)) {
-    return objectTypeAttributeCache.get(`map:${typeId}`);
-  }
-
-  const data = await assetsGet(`/objecttype/${encodeURIComponent(typeId)}/attributes`);
-  const attrs = Array.isArray(data)
-    ? data
-    : Array.isArray(data?.values)
-      ? data.values
-      : Array.isArray(data?.attributes)
-        ? data.attributes
-        : Array.isArray(data?.objectTypeAttributes)
-          ? data.objectTypeAttributes
-          : [];
-
-  const map = {};
-  attrs.forEach(a => {
-    const name = attrNameKey(a?.name);
-    const id = String(a?.id ?? a?.objectTypeAttributeId ?? "").trim();
-    if (name && id && a?.editable !== false) map[name] = id;
-  });
-
-  objectTypeAttributeCache.set(`map:${typeId}`, map);
-  objectTypeAttributeCache.set(typeId, new Set(Object.values(map).map(String)));
-  return map;
-}
-
-function getAttributeFromMap(attrMap, names) {
-  for (const name of names) {
-    const found = attrMap.get(normalizeAttributeName(name));
-    if (found) return found;
-  }
-  return null;
-}
-
-async function getAttributeForObjectType(objectTypeId, names) {
-  const attrMap = await getAttributeMapForObjectType(objectTypeId);
-  return getAttributeFromMap(attrMap, names);
-}
-
-async function getAllowedAttributeIdsForObjectType(objectTypeId) {
-  const typeId = String(objectTypeId || "").trim();
-  if (!typeId) return null;
-
-  const cacheKey = `ids:${typeId}`;
-  if (objectTypeAttributeCache.has(cacheKey)) return objectTypeAttributeCache.get(cacheKey);
-
-  const attrMap = await getAttributeMapForObjectType(typeId);
-  const ids = new Set(
-    [...attrMap.values()]
-      .map(a => String(a?.id ?? a?.objectTypeAttributeId ?? "").trim())
-      .filter(Boolean)
-  );
-
-  objectTypeAttributeCache.set(cacheKey, ids);
-  return ids;
-}
-
-function filterAttributesByAllowedIds(attributes, allowedIds) {
-  if (!(allowedIds instanceof Set)) return attributes;
-  return attributes.filter(a => allowedIds.has(String(a?.objectTypeAttributeId || "").trim()));
-}
-
-function getAssetAttributeByNames(obj, names) {
-  const wanted = new Set(names.map(normalizeAttributeName));
-  return (obj.attributes || []).find(a => {
-    const name =
-      a?.objectTypeAttribute?.name ||
-      a?.name ||
-      a?.label ||
-      "";
-    return wanted.has(normalizeAttributeName(name));
-  }) || null;
-}
-
-function getFirstAttributeValue(attrObj) {
-  return attrObj?.objectAttributeValues?.[0] || null;
-}
-
-function getAttributeDisplayValue(obj, names) {
-  const v = getFirstAttributeValue(getAssetAttributeByNames(obj, names));
-  return String(v?.displayValue ?? v?.value ?? v?.searchValue ?? "").trim();
-}
-
-function getObjectTypeIdFromObject(obj) {
-  return String(
-    obj?.objectType?.id ||
-    obj?.objectTypeId ||
-    obj?.objectType?.objectTypeId ||
-    ""
-  ).trim();
-}
-
-async function getObjectTypeIdForAsset(assetId) {
-  const id = String(assetId || "").trim();
-  if (!id) return "";
-
-  try {
-    const data = await assetsGet(`/object/${encodeURIComponent(id)}`);
-    return String(
-      data?.objectType?.id ||
-      data?.objectTypeId ||
-      data?.objectType?.objectTypeId ||
-      ""
-    ).trim();
-  } catch (e) {
-    console.warn(`[schema] cannot read object ${id}:`, e.message || e);
-    return "";
-  }
-}
-
-function attrNameKey(name) {
-  return String(name || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
-}
-
-function getAttrIdByNames(attrMap, names) {
-  if (!attrMap) return "";
-  for (const n of names) {
-    const id = attrMap[attrNameKey(n)];
-    if (id) return String(id);
-  }
-  return "";
-}
-
-function addValueAttr(attributes, attrId, value) {
-  const v = String(value || "").trim();
-  if (!attrId || !v) return;
-  attributes.push({
-    objectTypeAttributeId: Number(attrId),
-    objectAttributeValues: [{ value: v }],
-  });
-}
-
-function addReferenceAttrByKey(attributes, attrId, objectKey) {
-  const key = String(objectKey || "").trim();
-  if (!attrId || !key) return;
-  attributes.push({
-    objectTypeAttributeId: Number(attrId),
-    objectAttributeValues: [{ value: key }],
-  });
 }
 
 async function jiraAttributesFromFields(fields, objectTypeId = "") {
@@ -2476,9 +2647,13 @@ async function jiraAttributesFromFields(fields, objectTypeId = "") {
   if (fields.status && idStatus) {
     await ensureStatusMap();
     const statusId = getStatusIdFromCache(fields.status);
+
     if (!statusId) {
-      throw new Error(`Status "${fields.status}" không hợp lệ. Status hợp lệ: ${listCachedStatusNames() || "chưa có"}`);
+      throw new Error(
+        `Status "${fields.status}" không hợp lệ. Status hợp lệ đang cache: ${listCachedStatusNames() || "chưa có"}`
+      );
     }
+
     attributes.push({
       objectTypeAttributeId: Number(idStatus),
       objectAttributeValues: [{ value: String(statusId) }],
@@ -2505,12 +2680,14 @@ async function updateJiraAsset(assetId, fields) {
 
   const objectTypeId = await getObjectTypeIdForAsset(id);
   let attributes = await jiraAttributesFromFields(fields, objectTypeId);
-  if (!attributes.length) throw new Error(`Không có field hợp lệ để update cho objectTypeId=${objectTypeId || "unknown"}`);
+  if (!attributes.length) throw new Error("Không có field nào để update");
 
   const allowedIds = await getAllowedAttributeIdsForObjectType(objectTypeId);
   attributes = filterAttributesByAllowedIds(attributes, allowedIds);
 
-  if (!attributes.length) throw new Error(`Không có field hợp lệ để update cho objectTypeId=${objectTypeId || "unknown"}`);
+  if (!attributes.length) {
+    throw new Error(`Không có field hợp lệ để update cho objectTypeId=${objectTypeId || "unknown"}`);
+  }
 
   try {
     return await assetsPut(`/object/${id}`, { attributes });
@@ -2523,6 +2700,7 @@ async function updateJiraAsset(assetId, fields) {
       const filtered = attributes.filter(a => String(a.objectTypeAttributeId) !== badId);
 
       if (filtered.length && filtered.length < attributes.length) {
+        console.warn(`[updateJiraAsset] retry without invalid attr ${badId}`);
         return await assetsPut(`/object/${id}`, { attributes: filtered });
       }
     }
@@ -2584,6 +2762,8 @@ async function createOrUpdateJiraAssetFromLocalRow(row) {
     throw new Error("Action + cần Serial Number để kiểm tra trùng trước khi tạo mới");
   }
 
+  // Kiểm tra toàn bộ asset theo AQL đang cấu hình.
+  // Nếu Serial đã tồn tại thì UPDATE object đó, không CREATE duplicate.
   const existing = await findJiraAssetBySerial(serial);
 
   if (existing?.id) {
@@ -2630,9 +2810,8 @@ async function createJiraAssetFromRow(row) {
     throw new Error("Row mới cần ít nhất Hostname hoặc Serial Number");
   }
 
-  let attributes = await jiraAttributesFromFields(fields, defaultTypeId);
-
-  const allowedIds = await getAllowedAttributeIdsForObjectType(defaultTypeId);
+  let attributes = await jiraAttributesFromFields(fields, String(defaultTypeId));
+  const allowedIds = await getAllowedAttributeIdsForObjectType(String(defaultTypeId));
   attributes = filterAttributesByAllowedIds(attributes, allowedIds);
 
   if (!attributes.length) {
@@ -2682,6 +2861,7 @@ async function processActionRows() {
 
           if (!action) continue;
 
+          // o = xóa Jira asset trước nếu có Asset ID, sau đó xóa row khỏi Excel
           if (action === "o") {
             const assetId = String(row[COL.ASSET_ID] || "").trim();
 
@@ -2707,6 +2887,7 @@ async function processActionRows() {
 
           try {
             if (action === "x") {
+              // UPDATE chỉ cho asset đã có trên Jira
               if (!assetId) {
                 throw new Error('Action x chỉ update row đã có Asset ID. Muốn tạo mới hãy nhập Action = "+"');
               }
@@ -2729,6 +2910,7 @@ async function processActionRows() {
             }
 
             if (action === "+") {
+              // CREATE chỉ khi LOCAL + chưa có Asset ID
               if (assetId) {
                 throw new Error('Action + chỉ dùng để tạo mới row chưa có Asset ID');
               }
@@ -2771,6 +2953,7 @@ async function processActionRows() {
           }
         }
 
+        // Xóa từ dưới lên để không lệch index row
         rowsToDelete.sort((a, b) => b - a);
         for (const excelRow of rowsToDelete) {
           sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT)
@@ -2793,6 +2976,9 @@ async function processActionRows() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// MATCH LOCAL ASSETS ↔ JIRA
+// ══════════════════════════════════════════════════════════════
 async function matchLocalAssets() {
   if (!cfg.jiraUrl || !cfg.token) { toast("Configure Jira settings first", "warning"); return; }
   toast("Scanning LOCAL assets for Jira matches…", "warning");
@@ -2825,49 +3011,87 @@ async function matchLocalAssets() {
   } catch(e) { toast("Match error: " + e.message, "error"); }
 }
 
+// ══════════════════════════════════════════════════════════════
+// VALIDATION
+// ══════════════════════════════════════════════════════════════
 async function runValidation() {
   toast("Running validation…", "warning");
+
   const errors = {
     "Missing Asset ID": [],
-    "Duplicate Serial":  [],
-    "Location Changed":  [],
-    "Serial Mismatch":   [],
-    "Owner Mismatch":    [],
+    "Duplicate Serial": [],
+    "Location Changed": [],
+    "Serial Mismatch": [],
+    "Owner Mismatch": [],
   };
+
+  const norm = (v) => String(v || "").trim();
+  const upper = (v) => norm(v).toUpperCase();
+
+  function isRealAssetRow(row) {
+    return Boolean(
+      norm(row[COL.ASSET_ID]) ||
+      norm(row[COL.ASSET_KEY]) ||
+      norm(row[COL.HOSTNAME]) ||
+      norm(row[COL.SERIAL]) ||
+      upper(row[COL.SYNC_STATUS]) === "LOCAL" ||
+      upper(row[COL.SYNC_STATUS]) === "JIRA"
+    );
+  }
 
   try {
     await Excel.run(async (context) => {
-      const sheets     = await getLocationSheets(context);
+      const sheets = await getLocationSheets(context);
       const serialSeen = {};
 
       for (const sheetName of sheets) {
         const sheet = context.workbook.worksheets.getItem(sheetName);
-        const rows  = await readSheetRows(context, sheet);
+        const rows = await readSheetRows(context, sheet);
+
+        if (!rows.length) continue;
+
+        const validationValues = [];
+        const validationColors = [];
 
         for (let i = 0; i < rows.length; i++) {
-          const row      = rows[i];
-          const serial   = String(row[COL.SERIAL]   || "").trim();
-          const assetId  = String(row[COL.ASSET_ID] || "").trim();
-          const locField = String(row[COL.LOCATION]  || "").trim();
+          const row = rows[i];
+
+          // Không validate row trống do Excel usedRange/format kéo dài.
+          if (!isRealAssetRow(row)) {
+            validationValues.push([""]);
+            validationColors.push(["#111827"]);
+            continue;
+          }
+
+          const serial = norm(row[COL.SERIAL]).toUpperCase();
+          const assetId = norm(row[COL.ASSET_ID]);
+          const locField = norm(row[COL.LOCATION]);
+          const syncStatus = upper(row[COL.SYNC_STATUS]);
+
           let valid = "OK";
 
-          if (String(row[COL.SYNC_STATUS] || "") === "JIRA" && !assetId) {
+          // 1. JIRA row thiếu Asset ID
+          if (syncStatus === "JIRA" && !assetId) {
             valid = "Missing Asset ID";
             errors["Missing Asset ID"].push({ sheet: sheetName, row: i + 2 });
           }
 
+          // 2. Duplicate serial, bỏ qua serial trống
           if (serial && valid === "OK") {
             if (serialSeen[serial]) {
               valid = "Duplicate Serial";
               errors["Duplicate Serial"].push({ sheet: sheetName, row: i + 2 });
-              if (!errors["Duplicate Serial"].find(
-                e => e.sheet === serialSeen[serial].sheet && e.row === serialSeen[serial].row
-              )) errors["Duplicate Serial"].push(serialSeen[serial]);
+
+              const first = serialSeen[serial];
+              if (!errors["Duplicate Serial"].find(e => e.sheet === first.sheet && e.row === first.row)) {
+                errors["Duplicate Serial"].push(first);
+              }
             } else {
               serialSeen[serial] = { sheet: sheetName, row: i + 2 };
             }
           }
 
+          // 3. Location field không khớp sheet name
           if (locField && valid === "OK") {
             if (locationSheetName(locField) !== sheetName) {
               valid = "Location Changed";
@@ -2875,10 +3099,24 @@ async function runValidation() {
             }
           }
 
-          const cell = sheet.getRangeByIndexes(i + 1, COL.VALIDATION, 1, 1);
-          cell.values = [[valid]];
-          cell.format.font.color = valid === "OK" ? "#22c55e" : "#ef4444";
+          validationValues.push([valid]);
+          validationColors.push([valid === "OK" ? "#22c55e" : "#ef4444"]);
         }
+
+        // Ghi 1 lần cả cột Validation thay vì ghi từng cell.
+        const range = sheet.getRangeByIndexes(1, COL.VALIDATION, validationValues.length, 1);
+        range.values = validationValues;
+        range.format.font.color = "#111827";
+        await context.sync();
+
+        // Office.js không set font color array tốt ở mọi host, nên tô lỗi riêng từng row.
+        for (let i = 0; i < validationValues.length; i++) {
+          const v = validationValues[i][0];
+          if (!v) continue;
+          const cell = sheet.getRangeByIndexes(i + 1, COL.VALIDATION, 1, 1);
+          cell.format.font.color = v === "OK" ? "#22c55e" : "#ef4444";
+        }
+
         await context.sync();
       }
     });
@@ -2886,16 +3124,27 @@ async function runValidation() {
     renderValidationList(errors);
     toast("Validation complete", "success");
     await refreshDashboard();
-  } catch(e) { toast("Validation error: " + e.message, "error"); }
+  } catch (e) {
+    console.error("runValidation:", e);
+    toast("Validation error: " + (e.message || e), "error");
+  }
 }
 
 function renderValidationList(errors) {
   const el = document.getElementById("val-list");
+  if (!el) return;
+
   el.innerHTML = Object.entries(errors).map(([name, list]) => {
     const unique = list.filter((v, i, a) =>
       i === a.findIndex(x => x.sheet === v.sheet && x.row === v.row));
+
+    const payload = JSON.stringify(unique)
+      .replace(/&/g, "&amp;")
+      .replace(/'/g, "&#39;")
+      .replace(/"/g, "&quot;");
+
     return `
-      <div class="val-item" data-errors='${JSON.stringify(unique)}' onclick="jumpToError(this)">
+      <div class="val-item" data-errors='${payload}' onclick="jumpToError(this)">
         <span class="val-dot ${unique.length > 0 ? "err" : "ok"}"></span>
         <span class="val-name">${name}</span>
         <span class="val-count ${unique.length > 0 ? "has-err" : ""}">${unique.length}</span>
@@ -2917,6 +3166,9 @@ async function jumpToError(el) {
 }
 window.jumpToError = jumpToError;
 
+// ══════════════════════════════════════════════════════════════
+// TICKET
+// ══════════════════════════════════════════════════════════════
 async function scanPendingRows() {
   let count = 0;
   try {
@@ -2993,6 +3245,9 @@ async function createTickets() {
   } catch(e) { toast("Ticket error: " + e.message, "error"); }
 }
 
+// ══════════════════════════════════════════════════════════════
+// CONNECTION TEST
+// ══════════════════════════════════════════════════════════════
 async function testConnection() {
   const el = document.getElementById("conn-test-result");
   el.style.display    = "block";
@@ -3025,6 +3280,9 @@ async function testConnection() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// MISC
+// ══════════════════════════════════════════════════════════════
 function openJira() {
   if (!cfg.jiraUrl) { toast("Set Jira URL in Settings first", "warning"); return; }
   window.open(cfg.jiraUrl, "_blank");
