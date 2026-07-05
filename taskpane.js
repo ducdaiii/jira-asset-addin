@@ -2277,23 +2277,32 @@ function extractAttributeList(data) {
 
 async function getAttributeMapForObjectType(objectTypeId) {
   const typeId = String(objectTypeId || "").trim();
-  if (!typeId) return new Map();
+  if (!typeId) return {};
 
-  const cacheKey = `map:${typeId}`;
-  if (objectTypeAttributeCache.has(cacheKey)) return objectTypeAttributeCache.get(cacheKey);
+  if (objectTypeAttributeCache.has(`map:${typeId}`)) {
+    return objectTypeAttributeCache.get(`map:${typeId}`);
+  }
 
   const data = await assetsGet(`/objecttype/${encodeURIComponent(typeId)}/attributes`);
-  const attrs = extractAttributeList(data);
-  const map = new Map();
+  const attrs = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.values)
+      ? data.values
+      : Array.isArray(data?.attributes)
+        ? data.attributes
+        : Array.isArray(data?.objectTypeAttributes)
+          ? data.objectTypeAttributes
+          : [];
 
+  const map = {};
   attrs.forEach(a => {
+    const name = attrNameKey(a?.name);
     const id = String(a?.id ?? a?.objectTypeAttributeId ?? "").trim();
-    const name = normalizeAttributeName(a?.name);
-    if (!id || !name) return;
-    if (!map.has(name)) map.set(name, a);
+    if (name && id && a?.editable !== false) map[name] = id;
   });
 
-  objectTypeAttributeCache.set(cacheKey, map);
+  objectTypeAttributeCache.set(`map:${typeId}`, map);
+  objectTypeAttributeCache.set(typeId, new Set(Object.values(map).map(String)));
   return map;
 }
 
@@ -2381,76 +2390,110 @@ async function getObjectTypeIdForAsset(assetId) {
   }
 }
 
-async function jiraAttributesFromFields(fields, objectTypeId) {
+function attrNameKey(name) {
+  return String(name || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
+}
+
+function getAttrIdByNames(attrMap, names) {
+  if (!attrMap) return "";
+  for (const n of names) {
+    const id = attrMap[attrNameKey(n)];
+    if (id) return String(id);
+  }
+  return "";
+}
+
+function addValueAttr(attributes, attrId, value) {
+  const v = String(value || "").trim();
+  if (!attrId || !v) return;
+  attributes.push({
+    objectTypeAttributeId: Number(attrId),
+    objectAttributeValues: [{ value: v }],
+  });
+}
+
+function addReferenceAttrByKey(attributes, attrId, objectKey) {
+  const key = String(objectKey || "").trim();
+  if (!attrId || !key) return;
+  attributes.push({
+    objectTypeAttributeId: Number(attrId),
+    objectAttributeValues: [{ value: key }],
+  });
+}
+
+async function jiraAttributesFromFields(fields, objectTypeId = "") {
   const attributes = [];
+  const attrMap = await getAttributeMapForObjectType(objectTypeId);
 
-  const addValueByNames = async (names, value) => {
-    const v = String(value || "").trim();
-    if (!v) return;
+  const idName = getAttrIdByNames(attrMap, ["Name"]);
+  const idSerial = getAttrIdByNames(attrMap, ["Serial Number"]);
+  const idStatus = getAttrIdByNames(attrMap, ["Status"]);
+  const idLocation = getAttrIdByNames(attrMap, ["Location"]);
+  const idRegion = getAttrIdByNames(attrMap, ["Region"]);
+  const idManufacturer = getAttrIdByNames(attrMap, ["Manufacturer"]);
+  const idModel = getAttrIdByNames(attrMap, ["Model"]);
+  const idOs = getAttrIdByNames(attrMap, ["Operating System"]);
+  const idOsVersion = getAttrIdByNames(attrMap, ["Version OS", "Windows Version"]);
+  const idOsBuild = getAttrIdByNames(attrMap, ["OS Build", "Windows Build"]);
+  const idCpu = getAttrIdByNames(attrMap, ["Processor", "CPU"]);
+  const idIp = getAttrIdByNames(attrMap, ["IP Address"]);
+  const idMac = getAttrIdByNames(attrMap, ["MAC Address"]);
+  const idNetwork = getAttrIdByNames(attrMap, ["Network Name", "Domain"]);
+  const idAntivirus = getAttrIdByNames(attrMap, ["Antivirus"]);
+  const idUsername = getAttrIdByNames(attrMap, ["Username"]);
+  const idFirstSeen = getAttrIdByNames(attrMap, ["First Seen"]);
+  const idLastSeen = getAttrIdByNames(attrMap, ["Last Seen"]);
+  const idPurchase = getAttrIdByNames(attrMap, ["Purchased Date", "Purchase Date"]);
+  const idWarranty = getAttrIdByNames(attrMap, ["Warranty End Date", "Warranty Expire"]);
+  const idTenant = getAttrIdByNames(attrMap, ["Installation", "Tenant ID", "Tenant ID / Source ID"]);
+  const idLansweeper = getAttrIdByNames(attrMap, ["Lansweeper Asset URL", "Lansweeper URL"]);
+  const idNote = getAttrIdByNames(attrMap, ["Note"]);
+  const idOwner = getAttrIdByNames(attrMap, ["Owner", "Assigned User"]);
 
-    const attr = await getAttributeForObjectType(objectTypeId, names);
-    if (!attr) return;
+  addValueAttr(attributes, idName, fields.hostname);
+  addValueAttr(attributes, idSerial, fields.serial);
+  addValueAttr(attributes, idLocation, fields.location);
+  addValueAttr(attributes, idRegion, fields.region);
+  addValueAttr(attributes, idManufacturer, fields.manufacturer);
+  addValueAttr(attributes, idModel, fields.model);
+  addValueAttr(attributes, idOs, fields.os);
+  addValueAttr(attributes, idOsVersion, fields.osVersion);
+  addValueAttr(attributes, idOsBuild, fields.osBuild);
+  addValueAttr(attributes, idCpu, fields.cpu);
+  addValueAttr(attributes, idIp, fields.ip);
+  addValueAttr(attributes, idMac, fields.mac);
+  addValueAttr(attributes, idNetwork, fields.network);
+  addValueAttr(attributes, idAntivirus, fields.antivirus);
+  addValueAttr(attributes, idUsername, fields.username);
+  addValueAttr(attributes, idFirstSeen, fields.firstSeen);
+  addValueAttr(attributes, idLastSeen, fields.lastSeen);
+  addValueAttr(attributes, idPurchase, fields.purchase);
+  addValueAttr(attributes, idWarranty, fields.warranty);
+  addValueAttr(attributes, idTenant, fields.tenantId);
+  addValueAttr(attributes, idLansweeper, fields.lansweeper);
+  addValueAttr(attributes, idNote, fields.note);
 
-    attributes.push({
-      objectTypeAttributeId: Number(attr.id),
-      objectAttributeValues: [{ value: v }],
-    });
-  };
-
-  await addValueByNames(["Name"], fields.hostname);
-  await addValueByNames(["Serial Number"], fields.serial);
-  await addValueByNames(["Location"], fields.location);
-  await addValueByNames(["Domain", "Region"], fields.region);
-  await addValueByNames(["Manufacturer"], fields.manufacturer);
-  await addValueByNames(["Model"], fields.model);
-  await addValueByNames(["Operating System"], fields.os);
-  await addValueByNames(["Version OS", "Windows Version"], fields.osVersion);
-  await addValueByNames(["OS Build", "Windows Build"], fields.osBuild);
-  await addValueByNames(["Processor", "CPU"], fields.cpu);
-  await addValueByNames(["IP Address"], fields.ip);
-  await addValueByNames(["MAC Address"], fields.mac);
-  await addValueByNames(["IP Location", "Network Name"], fields.network);
-  await addValueByNames(["Antivirus"], fields.antivirus);
-  await addValueByNames(["Owner name", "Username"], fields.username);
-  await addValueByNames(["First Seen"], fields.firstSeen);
-  await addValueByNames(["Last Seen"], fields.lastSeen);
-  await addValueByNames(["Purchase Date", "Purchased Date"], fields.purchase);
-  await addValueByNames(["Warranty End Date", "Warranty Expire"], fields.warranty);
-  await addValueByNames(["Installation", "Tenant ID", "Tenant ID / Source ID"], fields.tenantId);
-  await addValueByNames(["Lansweeper Asset URL", "Lansweeper URL"], fields.lansweeper);
-
-  if (fields.status) {
-    const attr = await getAttributeForObjectType(objectTypeId, ["Status"]);
-    if (attr) {
-      await ensureStatusMap();
-      const statusId = getStatusIdFromCache(fields.status);
-
-      if (!statusId) {
-        throw new Error(`Status "${fields.status}" không hợp lệ. Status hợp lệ đang cache: ${listCachedStatusNames() || "chưa có"}`);
-      }
-
-      attributes.push({
-        objectTypeAttributeId: Number(attr.id),
-        objectAttributeValues: [{ value: String(statusId) }],
-      });
+  if (fields.status && idStatus) {
+    await ensureStatusMap();
+    const statusId = getStatusIdFromCache(fields.status);
+    if (!statusId) {
+      throw new Error(`Status "${fields.status}" không hợp lệ. Status hợp lệ: ${listCachedStatusNames() || "chưa có"}`);
     }
+    attributes.push({
+      objectTypeAttributeId: Number(idStatus),
+      objectAttributeValues: [{ value: String(statusId) }],
+    });
   }
 
-  if (fields.owner) {
-    const attr = await getAttributeForObjectType(objectTypeId, ["Owner", "Assigned User"]);
-    if (attr) {
-      await ensureOwnerMap(false);
-      const owner = getOwnerFromCache(fields.owner);
+  if (fields.owner && idOwner) {
+    await ensureOwnerMap(false);
+    const owner = getOwnerFromCache(fields.owner);
 
-      if (!owner?.id) {
-        throw new Error(`Owner "${fields.owner}" không có trong cache Owner. Hãy bấm "Refresh Metadata" rồi chọn lại Owner từ dropdown.`);
-      }
-
-      attributes.push({
-        objectTypeAttributeId: Number(attr.id),
-        objectAttributeValues: [{ referencedObjectBeanId: Number(owner.id) }],
-      });
+    if (!owner?.key) {
+      throw new Error(`Owner "${fields.owner}" không có Owner Key trong cache. Hãy bấm "Refresh Metadata" rồi chọn lại Owner từ dropdown.`);
     }
+
+    addReferenceAttrByKey(attributes, idOwner, owner.key);
   }
 
   return attributes;
