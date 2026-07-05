@@ -1491,6 +1491,64 @@ async function fetchOwnersSplitByAttribute(attrName) {
   };
 }
 
+
+async function fetchOwnersByAqlRecursive(label, makeQuery, prefix = "", depth = 0, seen = new Map()) {
+  let q;
+  try {
+    q = makeQuery(prefix);
+  } catch {
+    return { owners: [...seen.values()], complete: false, fetched: 0 };
+  }
+
+  let total = 0;
+  try {
+    total = await fetchTotalCount(q);
+  } catch (e) {
+    console.warn(`[ownerMap] count failed ${label} prefix="${prefix}":`, e.message || e);
+    return { owners: [...seen.values()], complete: false, fetched: 0 };
+  }
+
+  if (total === 0) return { owners: [...seen.values()], complete: true, fetched: 0 };
+
+  if (total < API_LIMIT) {
+    const list = await fetchOwnersUnderLimit(q);
+    list.forEach(o => {
+      const k = ownerDedupKey(o);
+      if (k && !seen.has(k)) seen.set(k, o);
+    });
+    console.log(`[ownerMap] ${label} prefix="${prefix}" total=${total}, fetched=${list.length}, unique=${seen.size}`);
+    return { owners: [...seen.values()], complete: list.length >= total, fetched: list.length };
+  }
+
+  if (depth >= OWNER_PREFIX_LIMIT) {
+    console.warn(`[ownerMap] capped ${label} prefix="${prefix}" total=${total}`);
+    const list = await fetchOwnersUnderLimit(q);
+    list.forEach(o => {
+      const k = ownerDedupKey(o);
+      if (k && !seen.has(k)) seen.set(k, o);
+    });
+    return { owners: [...seen.values()], complete: false, fetched: list.length };
+  }
+
+  let fetched = 0;
+  let complete = true;
+  for (const ch of OWNER_SPLIT_CHARS) {
+    const r = await fetchOwnersByAqlRecursive(label, makeQuery, prefix + ch, depth + 1, seen);
+    fetched += r.fetched || 0;
+    if (!r.complete) complete = false;
+  }
+
+  return { owners: [...seen.values()], complete, fetched };
+}
+
+function rememberOwnerListIntoSeen(list, seen) {
+  (list || []).forEach(o => {
+    const k = ownerDedupKey(o);
+    if (k && !seen.has(k)) seen.set(k, o);
+  });
+}
+
+
 async function fetchOwnersFromJira() {
   ownerNameToObject = {};
   ownerKeyToObject = {};
@@ -1502,10 +1560,11 @@ async function fetchOwnersFromJira() {
   console.log(`[ownerMap] total Users=${total}`);
   toast(`Đang tải Owner list: ${total} users`, "warning");
 
-  let owners = [];
+  const seen = new Map();
 
   if (total > 0 && total < API_LIMIT) {
-    owners = await fetchOwnersUnderLimit(baseQ);
+    const list = await fetchOwnersUnderLimit(baseQ);
+    rememberOwnerListIntoSeen(list, seen);
   } else {
     const splitAttrs = [
       "Name",
@@ -1516,44 +1575,62 @@ async function fetchOwnersFromJira() {
       "Username",
     ];
 
-    let best = { owners: [], fetched: 0, complete: false, attr: "" };
-
     for (const attrName of splitAttrs) {
       try {
         const result = await fetchOwnersRecursiveByAttribute(attrName);
-        console.log(`[ownerMap] recursive attr="${attrName}", unique=${result.owners.length}, fetched=${result.fetched}, complete=${result.complete}`);
+        rememberOwnerListIntoSeen(result.owners, seen);
+        console.log(`[ownerMap] merge attr="${attrName}", got=${result.owners.length}, globalUnique=${seen.size}`);
 
-        if (result.owners.length > best.owners.length) {
-          best = result;
-        }
-
-        if (total > 0 && result.owners.length >= total * 0.995) {
-          best = result;
-          break;
-        }
+        if (total > 0 && seen.size >= total * 0.995) break;
       } catch (e) {
-        console.warn(`[ownerMap] recursive split failed attr="${attrName}":`, e.message || e);
+        console.warn(`[ownerMap] recursive attr failed "${attrName}":`, e.message || e);
       }
     }
 
-    owners = best.owners;
+    if (total === 0 || seen.size < total * 0.995) {
+      const objectKeyStrategies = [
+        {
+          label: "objectKey AZD-",
+          makeQuery: (prefix) => `${baseQ} AND objectKey LIKE "AZD-${ownerEscapeAqlValue(prefix)}%"`,
+        },
+        {
+          label: "Key AZD-",
+          makeQuery: (prefix) => `${baseQ} AND Key LIKE "AZD-${ownerEscapeAqlValue(prefix)}%"`,
+        },
+        {
+          label: "Object key AZD-",
+          makeQuery: (prefix) => `${baseQ} AND "Object key" LIKE "AZD-${ownerEscapeAqlValue(prefix)}%"`,
+        },
+      ];
 
-    if (!owners.length) {
-      console.warn("[ownerMap] split returned 0 owner. Fallback to first API_LIMIT users from base query.");
-      owners = await fetchOwnersUnderLimit(baseQ);
+      for (const st of objectKeyStrategies) {
+        try {
+          const result = await fetchOwnersByAqlRecursive(st.label, st.makeQuery, "", 0, seen);
+          console.log(`[ownerMap] merge ${st.label}, fetched=${result.fetched}, globalUnique=${seen.size}`);
+
+          if (total > 0 && seen.size >= total * 0.995) break;
+        } catch (e) {
+          console.warn(`[ownerMap] objectKey strategy failed ${st.label}:`, e.message || e);
+        }
+      }
     }
 
-    console.log(`[ownerMap] best attr="${best.attr}", total=${total}, unique=${owners.length}, complete=${best.complete}`);
-
-    if (total > 0 && owners.length < total) {
-      toast(`⚠ Owner loaded ${owners.length}/${total}. Có thể còn thiếu user nếu bucket Jira vẫn >1000.`, "warning");
+    if (!seen.size) {
+      console.warn("[ownerMap] split returned 0 owner. Fallback to first API_LIMIT users from base query.");
+      const list = await fetchOwnersUnderLimit(baseQ);
+      rememberOwnerListIntoSeen(list, seen);
     }
   }
 
+  const owners = [...seen.values()];
   owners.forEach(o => rememberOwnerOption(o));
 
   ownerOptionsLoaded = owners.length > 0;
-  console.log(`[ownerMap] loaded ${owners.length} owners`);
+  console.log(`[ownerMap] loaded ${owners.length} owners, total=${total}`);
+
+  if (total > 0 && owners.length < total) {
+    toast(`⚠ Owner loaded ${owners.length}/${total}. Vẫn chưa đủ, xem console bucket nào bị capped.`, "warning");
+  }
 
   return owners;
 }
