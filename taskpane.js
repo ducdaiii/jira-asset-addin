@@ -1267,7 +1267,7 @@ function ownerDedupKey(owner) {
 }
 
 
-const OWNER_SPLIT_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split("");
+const OWNER_SPLIT_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".split("");
 const OWNER_PREFIX_LIMIT = 6;
 
 function ownerEscapeAqlValue(value) {
@@ -1301,19 +1301,27 @@ async function fetchOwnersRecursiveByPrefix(baseQ, attrName, prefix, seen, depth
     return { fetched: list.length, total, complete: list.length >= total };
   }
 
-  if (depth >= OWNER_PREFIX_LIMIT) {
-    console.warn(`[ownerMap] capped bucket attr="${attrName}" prefix="${prefix}" total=${total}. Fetch first ${API_LIMIT} only.`);
-    toast(`⚠ Owner bucket ${attrName}=${prefix}* có ${total} records, lấy tối đa ${API_LIMIT}`, "warning");
-    const list = await fetchOwnersUnderLimit(q);
-    list.forEach(o => {
+  let fetched = 0;
+  let complete = true;
+
+  try {
+    const firstList = await fetchOwnersUnderLimit(q);
+    firstList.forEach(o => {
       const k = ownerDedupKey(o);
       if (k && !seen.has(k)) seen.set(k, o);
     });
-    return { fetched: list.length, total, complete: false };
+    fetched += firstList.length;
+    console.log(`[ownerMap] capped fallback attr="${attrName}" prefix="${prefix}" total=${total}, first=${firstList.length}, unique=${seen.size}`);
+  } catch (e) {
+    console.warn(`[ownerMap] capped fallback failed attr="${attrName}" prefix="${prefix}":`, e.message || e);
+    complete = false;
   }
 
-  let fetched = 0;
-  let complete = true;
+  if (depth >= OWNER_PREFIX_LIMIT) {
+    console.warn(`[ownerMap] capped bucket attr="${attrName}" prefix="${prefix}" total=${total}. Fallback only.`);
+    toast(`⚠ Owner bucket ${attrName}=${prefix}* có ${total} records, đã lấy fallback ${Math.min(API_LIMIT, total)}`, "warning");
+    return { fetched, total, complete: false };
+  }
 
   for (const ch of OWNER_SPLIT_CHARS) {
     const r = await fetchOwnersRecursiveByPrefix(baseQ, attrName, prefix + ch, seen, depth + 1);
@@ -1520,18 +1528,27 @@ async function fetchOwnersByAqlRecursive(label, makeQuery, prefix = "", depth = 
     return { owners: [...seen.values()], complete: list.length >= total, fetched: list.length };
   }
 
-  if (depth >= OWNER_PREFIX_LIMIT) {
-    console.warn(`[ownerMap] capped ${label} prefix="${prefix}" total=${total}`);
-    const list = await fetchOwnersUnderLimit(q);
-    list.forEach(o => {
+  let fetched = 0;
+  let complete = true;
+
+  try {
+    const firstList = await fetchOwnersUnderLimit(q);
+    firstList.forEach(o => {
       const k = ownerDedupKey(o);
       if (k && !seen.has(k)) seen.set(k, o);
     });
-    return { owners: [...seen.values()], complete: false, fetched: list.length };
+    fetched += firstList.length;
+    console.log(`[ownerMap] capped fallback ${label} prefix="${prefix}" total=${total}, first=${firstList.length}, unique=${seen.size}`);
+  } catch (e) {
+    console.warn(`[ownerMap] capped fallback failed ${label} prefix="${prefix}":`, e.message || e);
+    complete = false;
   }
 
-  let fetched = 0;
-  let complete = true;
+  if (depth >= OWNER_PREFIX_LIMIT) {
+    console.warn(`[ownerMap] capped ${label} prefix="${prefix}" total=${total}. Fallback only.`);
+    return { owners: [...seen.values()], complete: false, fetched };
+  }
+
   for (const ch of OWNER_SPLIT_CHARS) {
     const r = await fetchOwnersByAqlRecursive(label, makeQuery, prefix + ch, depth + 1, seen);
     fetched += r.fetched || 0;
@@ -1574,6 +1591,17 @@ async function fetchOwnersFromJira() {
       "User principal name",
       "Username",
     ];
+
+    for (const attrName of splitAttrs) {
+      try {
+        const legacyResult = await fetchOwnersSplitByAttribute(attrName);
+        rememberOwnerListIntoSeen(legacyResult.owners, seen);
+        console.log(`[ownerMap] legacy merge attr="${attrName}", got=${legacyResult.owners.length}, globalUnique=${seen.size}`);
+        if (total > 0 && seen.size >= total * 0.995) break;
+      } catch (e) {
+        console.warn(`[ownerMap] legacy split failed "${attrName}":`, e.message || e);
+      }
+    }
 
     for (const attrName of splitAttrs) {
       try {
