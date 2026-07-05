@@ -167,7 +167,41 @@ function listCachedStatusNames() {
 }
 
 function normalizeOwnerName(value) {
-  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return String(value || "")
+    .trim()
+    .replace(/\s*\([^)]*\)\s*/g, " ")     // bỏ "(Le Thi Hai Thu | Human Resources)"
+    .replace(/\s*\[[^\]]*\]\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function ownerNameAliases(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+
+  const noParen = raw
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const aliases = new Set([raw, noParen]);
+
+  // "Thu, Lisa" -> "Lisa Thu"
+  const commaName = noParen.match(/^([^,]+),\s*(.+)$/);
+  if (commaName) {
+    aliases.add(`${commaName[2]} ${commaName[1]}`.trim());
+  }
+
+  // "Thu, Lisa (Le Thi Hai Thu | Human Resources)" -> "Le Thi Hai Thu"
+  const inside = raw.match(/\(([^|)]+)(?:\|[^)]*)?\)/);
+  if (inside && inside[1]) {
+    aliases.add(inside[1].trim());
+  }
+
+  return [...aliases]
+    .map(x => String(x || "").trim())
+    .filter(Boolean);
 }
 
 function rememberOwnerOption(owner) {
@@ -179,14 +213,38 @@ function rememberOwnerOption(owner) {
   const username = String(owner?.username || owner?.userName || owner?.searchValue || "").trim() || key || label;
 
   const item = { id, key, label, username };
-  ownerNameToObject[normalizeOwnerName(label)] = item;
+
+  ownerNameAliases(label).forEach(alias => {
+    ownerNameToObject[normalizeOwnerName(alias)] = item;
+  });
+
+  ownerNameAliases(username).forEach(alias => {
+    ownerNameToObject[normalizeOwnerName(alias)] = item;
+  });
+
   if (key) ownerKeyToObject[key.toUpperCase()] = item;
 }
 
 function getOwnerFromCache(value) {
   const raw = String(value || "").trim();
   if (!raw) return null;
-  return ownerNameToObject[normalizeOwnerName(raw)] || ownerKeyToObject[raw.toUpperCase()] || null;
+
+  const byKey = ownerKeyToObject[raw.toUpperCase()];
+  if (byKey) return byKey;
+
+  for (const alias of ownerNameAliases(raw)) {
+    const found = ownerNameToObject[normalizeOwnerName(alias)];
+    if (found) return found;
+  }
+
+  // Fallback mềm: Excel value chứa label hoặc ngược lại.
+  const needle = normalizeOwnerName(raw);
+  for (const [k, owner] of Object.entries(ownerNameToObject)) {
+    if (!k || !needle) continue;
+    if (k.includes(needle) || needle.includes(k)) return owner;
+  }
+
+  return null;
 }
 
 function getCachedOwnerNamesArray() {
@@ -232,6 +290,20 @@ function parseOwnerObject(obj) {
   if (!owner.username) owner.username = owner.key || owner.label;
 
   rememberOwnerOption(owner);
+
+  [
+    obj?.displayValue,
+    obj?.searchValue,
+    obj?.name,
+    obj?.label,
+    obj?.objectKey,
+    obj?.key,
+  ].forEach(v => {
+    ownerNameAliases(v).forEach(alias => {
+      ownerNameToObject[normalizeOwnerName(alias)] = owner;
+    });
+  });
+
   return owner;
 }
 
@@ -2142,12 +2214,29 @@ function isLocalRow(row) {
 
 function rowToJiraFields(row) {
   return {
-    hostname: String(row[COL.HOSTNAME] || "").trim(),
-    serial:   String(row[COL.SERIAL]   || "").trim(),
-    location: String(row[COL.LOCATION] || "").trim(),
-    status:   String(row[COL.STATUS]   || "").trim(),
-    owner:    String(row[COL.ASSIGNED]  || "").trim(),
-    purchase: normalizeJiraDate(row[COL.PURCHASE]),
+    hostname:     String(row[COL.HOSTNAME]     || "").trim(),
+    serial:       String(row[COL.SERIAL]       || "").trim(),
+    status:       String(row[COL.STATUS]       || "").trim(),
+    location:     String(row[COL.LOCATION]     || "").trim(),
+    region:       String(row[COL.REGION]       || "").trim(),
+    manufacturer: String(row[COL.MANUFACTURER] || "").trim(),
+    model:        String(row[COL.MODEL]        || "").trim(),
+    os:           String(row[COL.OS]           || "").trim(),
+    osVersion:    String(row[COL.OS_VERSION]   || "").trim(),
+    osBuild:      String(row[COL.OS_BUILD]     || "").trim(),
+    cpu:          String(row[COL.CPU]          || "").trim(),
+    ip:           String(row[COL.IP]           || "").trim(),
+    mac:          String(row[COL.MAC]          || "").trim(),
+    network:      String(row[COL.NETWORK]      || "").trim(),
+    antivirus:    String(row[COL.ANTIVIRUS]    || "").trim(),
+    username:     String(row[COL.USERNAME]     || "").trim(),
+    owner:        String(row[COL.ASSIGNED]     || "").trim(),
+    firstSeen:    normalizeJiraDateTime(row[COL.FIRST_SEEN]),
+    lastSeen:     normalizeJiraDateTime(row[COL.LAST_SEEN]),
+    purchase:     normalizeJiraDate(row[COL.PURCHASE]),
+    warranty:     normalizeJiraDate(row[COL.WARRANTY]),
+    tenantId:     String(row[COL.TENANT_ID]    || "").trim(),
+    lansweeper:   String(row[COL.LANSWEEPER]   || "").trim(),
   };
 }
 
@@ -2171,6 +2260,29 @@ function normalizeJiraDate(value) {
 
   return raw;
 }
+
+function normalizeJiraDateTime(value) {
+  if (!value) return "";
+
+  // Excel date serial number -> ISO datetime
+  if (typeof value === "number") {
+    const d = new Date(Math.round((value - 25569) * 86400 * 1000));
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  // Đã là ISO datetime
+  if (/^\d{4}-\d{2}-\d{2}T/.test(raw)) return raw;
+
+  const d = new Date(raw);
+  if (!isNaN(d.getTime())) return d.toISOString();
+
+  // Nếu Jira đang nhận display string kiểu "24/Jun/25 2:14 AM" thì giữ nguyên.
+  return raw;
+}
+
 
 function ingestStatusResponse(data) {
   const list = Array.isArray(data)
@@ -2386,7 +2498,6 @@ async function ensureStatusMap() {
   console.log(`[statusMap] loaded ${getCachedStatusNamesArray().length} status: ${listCachedStatusNames()}`);
 }
 
-async 
 async function getObjectTypeIdForAsset(assetId) {
   const id = String(assetId || "").trim();
   if (!id) return "";
@@ -2461,15 +2572,30 @@ async function jiraAttributesFromFields(fields) {
     });
   };
 
-  // Theo object JSON bạn gửi:
-  // Hostname 1737, Serial Number 5194, Location 30125, Purchase Date 5203.
-  addValue(1737, fields.hostname);
-  addValue(5194, fields.serial);
-  addValue(30125, fields.location);
-  addValue(5203, fields.purchase);
+  // Text/value attributes theo schema object hiện tại
+  addValue(1737,  fields.hostname);      // Hostname / Name
+  addValue(5194,  fields.serial);        // Serial Number
+  addValue(30125, fields.location);      // Location
+  addValue(27292, fields.region);        // Region
+  addValue(6608,  fields.manufacturer);  // Manufacturer
+  addValue(6609,  fields.model);         // Model
+  addValue(30345, fields.os);            // Operating System
+  addValue(27291, fields.osVersion);     // Windows Version
+  addValue(27290, fields.osBuild);       // Windows Build
+  addValue(6610,  fields.cpu);           // CPU
+  addValue(5208,  fields.ip);            // IP Address
+  addValue(5209,  fields.mac);           // MAC Address
+  addValue(5210,  fields.network);       // Network Name
+  addValue(6612,  fields.antivirus);     // Antivirus
+  addValue(5200,  fields.username);      // Username
+  addValue(5205,  fields.firstSeen);     // First Seen
+  addValue(5206,  fields.lastSeen);      // Last Seen
+  addValue(5203,  fields.purchase);      // Purchase Date
+  addValue(6615,  fields.warranty);      // Warranty Expire
+  addValue(26398, fields.tenantId);      // Tenant ID / Source ID
+  addValue(5207,  fields.lansweeper);    // Lansweeper URL
 
   // Status 5052 là status type, không gửi text. Phải map name -> status.id.
-  // Ví dụ In Use -> 31.
   if (fields.status) {
     await ensureStatusMap();
     const statusId = getStatusIdFromCache(fields.status);
@@ -2529,7 +2655,25 @@ async function updateJiraAsset(assetId, fields) {
     throw new Error(`Không có field hợp lệ để update cho objectTypeId=${objectTypeId || "unknown"}`);
   }
 
-  return assetsPut(`/object/${id}`, { attributes });
+  try {
+    return await assetsPut(`/object/${id}`, { attributes });
+  } catch (e) {
+    // Fallback: nếu Jira vẫn báo attribute không hợp lệ, bỏ attr đó và thử lại.
+    const msg = String(e?.message || e || "");
+    const m = msg.match(/Object Type Attribute not valid \(id:\s*(\d+)\)/i);
+
+    if (m && m[1]) {
+      const badId = String(m[1]);
+      const filtered = attributes.filter(a => String(a.objectTypeAttributeId) !== badId);
+
+      if (filtered.length && filtered.length < attributes.length) {
+        console.warn(`[updateJiraAsset] retry without invalid attr ${badId}`);
+        return await assetsPut(`/object/${id}`, { attributes: filtered });
+      }
+    }
+
+    throw e;
+  }
 }
 
 function escapeAqlString(value) {
