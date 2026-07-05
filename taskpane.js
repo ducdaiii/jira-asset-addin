@@ -1,16 +1,4 @@
-/* ════════════════════════════════════════════════════════════
-   Jira Asset Manager — Office Add-in
-   PATCH: auto-move rows to correct Location sheet on sync
-   taskpane.js  v2.0  (clean rewrite — all bugs fixed)
 
-   FIXES vs v1.3:
-   1. fetchSafe()     — hard-stop tại API_LIMIT=1000, không loop vô tận
-   2. fetchByOsBuild  — dùng fetchTotalCount trước mỗi build
-   3. writeLocationSheet — UPDATE đầy đủ tất cả cột Jira (không chỉ LAST_SYNC)
-   4. runSync         — KHÔNG reset locationMap; mỗi typeId ghi độc lập
-   5. fetchOsVersions — discover qua AQL tổng hợp thay vì chỉ 1000 mẫu
-   6. byId / byKey    — build lookup đúng, trim chuẩn
-   ════════════════════════════════════════════════════════════ */
 
 "use strict";
 
