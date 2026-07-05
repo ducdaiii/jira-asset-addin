@@ -186,14 +186,16 @@ function ownerNameAliases(value) {
   const aliases = new Set([raw, noParen]);
 
   const commaName = noParen.match(/^([^,]+),\s*(.+)$/);
-  if (commaName) aliases.add(`${commaName[2]} ${commaName[1]}`.trim());
+  if (commaName) {
+    aliases.add(`${commaName[2]} ${commaName[1]}`.trim());
+  }
 
   const inside = raw.match(/\(([^|)]+)(?:\|[^)]*)?\)/);
-  if (inside && inside[1]) aliases.add(inside[1].trim());
+  if (inside && inside[1]) {
+    aliases.add(inside[1].trim());
+  }
 
-  return [...aliases]
-    .map(x => String(x || "").trim())
-    .filter(Boolean);
+  return [...aliases].map(x => String(x || "").trim()).filter(Boolean);
 }
 
 function rememberOwnerOption(owner) {
@@ -1264,6 +1266,110 @@ function ownerDedupKey(owner) {
   return "";
 }
 
+
+const OWNER_SPLIT_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split("");
+const OWNER_PREFIX_LIMIT = 6;
+
+function ownerEscapeAqlValue(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function ownerPrefixQuery(baseQ, attrName, prefix) {
+  return `${baseQ} AND "${attrName}" LIKE "${ownerEscapeAqlValue(prefix)}%"`;
+}
+
+async function fetchOwnersRecursiveByPrefix(baseQ, attrName, prefix, seen, depth = 0) {
+  const q = ownerPrefixQuery(baseQ, attrName, prefix);
+  let total = 0;
+
+  try {
+    total = await fetchTotalCount(q);
+  } catch (e) {
+    console.warn(`[ownerMap] count failed attr="${attrName}" prefix="${prefix}":`, e.message || e);
+    return { fetched: 0, total: 0, complete: false };
+  }
+
+  if (total === 0) return { fetched: 0, total: 0, complete: true };
+
+  if (total < API_LIMIT) {
+    const list = await fetchOwnersUnderLimit(q);
+    list.forEach(o => {
+      const k = ownerDedupKey(o);
+      if (k && !seen.has(k)) seen.set(k, o);
+    });
+    console.log(`[ownerMap] attr="${attrName}" prefix="${prefix}" total=${total}, fetched=${list.length}, unique=${seen.size}`);
+    return { fetched: list.length, total, complete: list.length >= total };
+  }
+
+  if (depth >= OWNER_PREFIX_LIMIT) {
+    console.warn(`[ownerMap] capped bucket attr="${attrName}" prefix="${prefix}" total=${total}. Fetch first ${API_LIMIT} only.`);
+    toast(`⚠ Owner bucket ${attrName}=${prefix}* có ${total} records, lấy tối đa ${API_LIMIT}`, "warning");
+    const list = await fetchOwnersUnderLimit(q);
+    list.forEach(o => {
+      const k = ownerDedupKey(o);
+      if (k && !seen.has(k)) seen.set(k, o);
+    });
+    return { fetched: list.length, total, complete: false };
+  }
+
+  let fetched = 0;
+  let complete = true;
+
+  for (const ch of OWNER_SPLIT_CHARS) {
+    const r = await fetchOwnersRecursiveByPrefix(baseQ, attrName, prefix + ch, seen, depth + 1);
+    fetched += r.fetched;
+    if (!r.complete) complete = false;
+  }
+
+  console.log(`[ownerMap] split attr="${attrName}" prefix="${prefix}" total=${total}, childFetched=${fetched}, unique=${seen.size}`);
+  return { fetched, total, complete };
+}
+
+async function fetchOwnersRecursiveByAttribute(attrName) {
+  const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
+  const seen = new Map();
+  let fetched = 0;
+  let complete = true;
+
+  for (const ch of OWNER_SPLIT_CHARS) {
+    const r = await fetchOwnersRecursiveByPrefix(baseQ, attrName, ch, seen, 1);
+    fetched += r.fetched;
+    if (!r.complete) complete = false;
+  }
+
+  const notLike = OWNER_SPLIT_CHARS
+    .map(ch => `"${attrName}" NOT LIKE "${ch}%"`)
+    .join(" AND ");
+
+  try {
+    const otherQ = `${baseQ} AND ${notLike}`;
+    const otherTotal = await fetchTotalCount(otherQ);
+    if (otherTotal > 0) {
+      if (otherTotal < API_LIMIT) {
+        const list = await fetchOwnersUnderLimit(otherQ);
+        list.forEach(o => {
+          const k = ownerDedupKey(o);
+          if (k && !seen.has(k)) seen.set(k, o);
+        });
+        fetched += list.length;
+      } else {
+        complete = false;
+        console.warn(`[ownerMap] non-alnum bucket too large attr="${attrName}" total=${otherTotal}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[ownerMap] non-alnum bucket failed attr="${attrName}":`, e.message || e);
+  }
+
+  return {
+    owners: [...seen.values()],
+    fetched,
+    complete,
+    attr: attrName,
+  };
+}
+
+
 async function fetchOwnersUnderLimit(qlQuery) {
   const PAGE = 100;
   const owners = [];
@@ -1386,7 +1492,6 @@ async function fetchOwnersSplitByAttribute(attrName) {
 }
 
 async function fetchOwnersFromJira() {
-  // Reset cache để Refresh Owner luôn lấy mới.
   ownerNameToObject = {};
   ownerKeyToObject = {};
   ownerOptionsLoaded = false;
@@ -1395,14 +1500,13 @@ async function fetchOwnersFromJira() {
   const total = await fetchTotalCount(baseQ).catch(() => 0);
 
   console.log(`[ownerMap] total Users=${total}`);
+  toast(`Đang tải Owner list: ${total} users`, "warning");
 
   let owners = [];
 
   if (total > 0 && total < API_LIMIT) {
     owners = await fetchOwnersUnderLimit(baseQ);
   } else {
-    // Users >= 1000: chia theo attribute tên giống cách device chia theo Version OS.
-    // Thử nhiều field phổ biến vì schema Users có thể đặt tên attribute khác nhau.
     const splitAttrs = [
       "Name",
       "Display Name",
@@ -1412,30 +1516,32 @@ async function fetchOwnersFromJira() {
       "Username",
     ];
 
-    let best = { owners: [], rawFetched: 0, successBuckets: 0, attr: "" };
+    let best = { owners: [], fetched: 0, complete: false, attr: "" };
 
     for (const attrName of splitAttrs) {
-      const result = await fetchOwnersSplitByAttribute(attrName);
+      try {
+        const result = await fetchOwnersRecursiveByAttribute(attrName);
+        console.log(`[ownerMap] recursive attr="${attrName}", unique=${result.owners.length}, fetched=${result.fetched}, complete=${result.complete}`);
 
-      if (result.owners.length > best.owners.length) {
-        best = { ...result, attr: attrName };
-      }
+        if (result.owners.length > best.owners.length) {
+          best = result;
+        }
 
-      // Nếu đã lấy gần đủ total thì dừng.
-      if (total > 0 && result.owners.length >= total * 0.98) {
-        best = { ...result, attr: attrName };
-        break;
+        if (total > 0 && result.owners.length >= total * 0.995) {
+          best = result;
+          break;
+        }
+      } catch (e) {
+        console.warn(`[ownerMap] recursive split failed attr="${attrName}":`, e.message || e);
       }
     }
 
     owners = best.owners;
 
-    console.log(
-      `[ownerMap] split done attr="${best.attr}", total=${total}, unique=${owners.length}, raw=${best.rawFetched}, buckets=${best.successBuckets}`
-    );
+    console.log(`[ownerMap] best attr="${best.attr}", total=${total}, unique=${owners.length}, complete=${best.complete}`);
 
     if (total > 0 && owners.length < total) {
-      toast(`⚠ Owner loaded ${owners.length}/${total}. Nếu thiếu user, cần chỉnh split attribute cho Users schema.`, "warning");
+      toast(`⚠ Owner loaded ${owners.length}/${total}. Có thể còn thiếu user nếu bucket Jira vẫn >1000.`, "warning");
     }
   }
 
@@ -1533,10 +1639,24 @@ async function writeOwnerMetadataSheet(context) {
 
   sheet.getRangeByIndexes(0, 0, 1, 4).values = [["Owner Name", "Owner ID", "Owner Key", "Username"]];
 
-  const rows = names.map(name => {
-    const o = getOwnerFromCache(name) || {};
-    return [name, o.id || "", o.key || "", o.username || ""];
+  const ownerItems = [];
+  const seenKeys = new Set();
+
+  Object.values(ownerNameToObject).forEach(o => {
+    const k = String(o?.id || o?.key || o?.label || "").trim();
+    if (!k || seenKeys.has(k)) return;
+    seenKeys.add(k);
+    ownerItems.push(o);
   });
+
+  ownerItems.sort((a, b) => String(a.label || "").localeCompare(String(b.label || "")));
+
+  const rows = ownerItems.map(o => [
+    o.label || "",
+    o.id || "",
+    o.key || "",
+    o.username || "",
+  ]);
 
   sheet.getRangeByIndexes(1, 0, rows.length, 4).values = rows;
 
