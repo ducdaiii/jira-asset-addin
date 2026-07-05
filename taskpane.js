@@ -1680,22 +1680,65 @@ async function fetchOwnersAlphabetAndAttributeMerge() {
 }
 
 async function fetchOwnersFromJira() {
+  // Reset cache để Refresh Owner luôn lấy mới.
   ownerNameToObject = {};
   ownerKeyToObject = {};
   ownerOptionsLoaded = false;
 
-  const result = await fetchOwnersAlphabetAndAttributeMerge();
-  const owners = result.owners || [];
-  const total = result.total || 0;
+  const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
+  const total = await fetchTotalCount(baseQ).catch(() => 0);
+
+  console.log(`[ownerMap] total Users=${total}`);
+
+  let owners = [];
+
+  if (total > 0 && total < API_LIMIT) {
+    owners = await fetchOwnersUnderLimit(baseQ);
+  } else {
+    // Users >= 1000: chia theo attribute tên giống cách device chia theo Version OS.
+    // Thử nhiều field phổ biến vì schema Users có thể đặt tên attribute khác nhau.
+    const splitAttrs = [
+      "Name",
+      "Display Name",
+      "Full Name",
+      "Email",
+      "User principal name",
+      "Username",
+    ];
+
+    let best = { owners: [], rawFetched: 0, successBuckets: 0, attr: "" };
+
+    for (const attrName of splitAttrs) {
+      const result = await fetchOwnersSplitByAttribute(attrName);
+
+      if (result.owners.length > best.owners.length) {
+        best = { ...result, attr: attrName };
+      }
+
+      // Nếu đã lấy gần đủ total thì dừng.
+      if (total > 0 && result.owners.length >= total * 0.98) {
+        best = { ...result, attr: attrName };
+        break;
+      }
+    }
+
+    owners = best.owners;
+
+    console.log(`[ownerMap] USING OLD OWNER LOADER, selected attr="${best.attr}", unique=${owners.length}, raw=${best.rawFetched}, buckets=${best.successBuckets}`);
+
+    console.log(
+      `[ownerMap] split done attr="${best.attr}", total=${total}, unique=${owners.length}, raw=${best.rawFetched}, buckets=${best.successBuckets}`
+    );
+
+    if (total > 0 && owners.length < total) {
+      toast(`⚠ Owner loaded ${owners.length}/${total}. Nếu thiếu user, cần chỉnh split attribute cho Users schema.`, "warning");
+    }
+  }
 
   owners.forEach(o => rememberOwnerOption(o));
 
   ownerOptionsLoaded = owners.length > 0;
-  console.log(`[ownerMap] loaded ${owners.length} owners, total=${total}`);
-
-  if (total > 0 && owners.length < total) {
-    toast(`⚠ Owner loaded ${owners.length}/${total}. Nếu vẫn thiếu, gửi log [ownerMap] để xem bucket nào lỗi.`, "warning");
-  }
+  console.log(`[ownerMap] loaded ${owners.length} owners`);
 
   return owners;
 }
@@ -1894,8 +1937,14 @@ async function refreshMetadataDropdowns() {
 
       for (const sheetName of sheets) {
         const sheet = context.workbook.worksheets.getItem(sheetName);
-        if (statusOk) await applyStatusDropdownToSheet(context, sheet);
-        if (ownerOk && ownerSource) await applyOwnerDropdownToSheet(context, sheet, ownerSource);
+
+        if (statusOk) {
+          await applyStatusDropdownToSheet(context, sheet);
+        }
+
+        if (ownerOk && ownerSource) {
+          await applyOwnerDropdownToSheet(context, sheet, ownerSource);
+        }
       }
 
       await context.sync();
@@ -1911,7 +1960,11 @@ async function refreshMetadataDropdowns() {
       ownerOk ? `Owner=${getCachedOwnerNamesArray().length}` : "Owner=FAILED",
     ].join(", ");
 
-    toast(`Refresh Metadata xong: ${msg}`, statusOk || ownerOk ? "success" : "error");
+    if (statusOk || ownerOk) {
+      toast(`Refresh Metadata xong: ${msg}`, ownerOk ? "success" : "warning");
+    } else {
+      toast(`Refresh Metadata lỗi: Status=${statusErr}; Owner=${ownerErr}`, "error");
+    }
   } catch (e) {
     console.warn("refreshMetadataDropdowns:", e.message || e);
     toast("Refresh Metadata lỗi: " + (e.message || e), "warning");
