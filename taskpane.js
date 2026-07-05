@@ -1669,7 +1669,7 @@ async function writeOwnerMetadataSheet(context) {
   try { sheet.visibility = Excel.SheetVisibility.hidden; } catch (_) {}
   await context.sync();
 
-  return `=${OWNER_METADATA_SHEET}!$A$2:$A$${rows.length + 1}`;
+  return `='${OWNER_METADATA_SHEET}'!$A$2:$A$${rows.length + 1}`;
 }
 
 async function applyOwnerDropdownToSheet(context, sheet, ownerSourceRangeFormula) {
