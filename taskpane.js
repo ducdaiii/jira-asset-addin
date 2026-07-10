@@ -243,35 +243,34 @@ function getCachedOwnerNamesArray() {
 
 function parseOwnerObject(obj) {
   const owner = {
-    id: String(obj?.id ?? obj?.objectId ?? ""),
-    key: String(obj?.objectKey || obj?.key || ""),
-    label: String(obj?.label || obj?.name || ""),
+    id: String(obj?.id ?? obj?.objectId ?? "").trim(),
+    key: String(obj?.objectKey || obj?.key || "").trim(),
+    label: String(obj?.label || obj?.name || "").trim(),
     username: "",
   };
 
-  const attrs = obj?.attributes || [];
-  for (const a of attrs) {
-    const vals = a?.objectAttributeValues || [];
-    const v = vals[0] || {};
-    const display = String(v.displayValue || v.value || v.searchValue || "").trim();
-    const attrName = String(a?.objectTypeAttribute?.name || a.name || a.label || "").toLowerCase();
+  const attrValueById = (id) => {
+    const a = (obj?.attributes || []).find(
+      x => String(x?.objectTypeAttributeId || x?.id || "") === String(id)
+    );
+    const v = a?.objectAttributeValues?.[0] || {};
+    return String(v?.displayValue || v?.searchValue || v?.value || "").trim();
+  };
 
-    if (!owner.username && display && (
-      attrName.includes("username") ||
-      attrName.includes("user name") ||
-      attrName.includes("email") ||
-      attrName.includes("mail") ||
-      attrName.includes("login")
-    )) {
-      owner.username = display;
-    }
-  }
+  const email = attrValueById("3227");
+  const upn = attrValueById("3223");
+  const name = attrValueById("3203");
 
-  if (!owner.username) owner.username = owner.key || owner.label;
+  owner.label = owner.label || name || owner.key;
+  owner.username = email || upn || owner.key || owner.label;
 
   rememberOwnerOption(owner);
 
   [
+    owner.label,
+    owner.username,
+    email,
+    upn,
     obj?.displayValue,
     obj?.searchValue,
     obj?.name,
@@ -1679,66 +1678,111 @@ async function fetchOwnersAlphabetAndAttributeMerge() {
   return { owners: [...seen.values()], total };
 }
 
+
+const OWNER_KEY_MAX_DEPTH = 9;
+
+async function fetchOwnerKeyBucket(prefix, seen, depth = 0) {
+  const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
+  const q = `${baseQ} AND objectKey LIKE "AZD-${prefix}%"`;
+
+  let total = 0;
+  try {
+    total = await fetchTotalCount(q);
+  } catch (e) {
+    console.warn(`[ownerKey] count failed prefix=${prefix}:`, e.message || e);
+    return { total: 0, loaded: 0, complete: false };
+  }
+
+  if (total === 0) return { total: 0, loaded: 0, complete: true };
+
+  if (total < API_LIMIT) {
+    const list = await fetchOwnersUnderLimit(q);
+    rememberOwnerListIntoSeen(list, seen);
+    console.log(`[ownerKey] AZD-${prefix}*: total=${total}, loaded=${list.length}, unique=${seen.size}`);
+    return { total, loaded: list.length, complete: list.length >= total };
+  }
+
+  if (depth >= OWNER_KEY_MAX_DEPTH) {
+    const list = await fetchOwnersUnderLimit(q);
+    rememberOwnerListIntoSeen(list, seen);
+    console.warn(`[ownerKey] capped AZD-${prefix}*: total=${total}, loaded=${list.length}`);
+    return { total, loaded: list.length, complete: false };
+  }
+
+  let loaded = 0;
+  let complete = true;
+  for (let digit = 0; digit <= 9; digit++) {
+    const result = await fetchOwnerKeyBucket(prefix + digit, seen, depth + 1);
+    loaded += result.loaded;
+    if (!result.complete) complete = false;
+  }
+
+  console.log(`[ownerKey] split AZD-${prefix}*: total=${total}, unique=${seen.size}`);
+  return { total, loaded, complete };
+}
+
+async function fetchOwnersByObjectKey() {
+  const seen = new Map();
+  for (let digit = 0; digit <= 9; digit++) {
+    await fetchOwnerKeyBucket(String(digit), seen, 1);
+  }
+  return [...seen.values()];
+}
+
+async function fetchOwnersFallbackMerge(seen, total) {
+  const attrs = ["Name", "Display Name", "Full Name", "Email", "User principal name", "Username"];
+  for (const attrName of attrs) {
+    try {
+      const result = await fetchOwnersSplitByAttribute(attrName);
+      rememberOwnerListIntoSeen(result.owners, seen);
+      console.log(`[ownerFallback] attr="${attrName}", got=${result.owners.length}, unique=${seen.size}`);
+      if (total > 0 && seen.size >= total) break;
+    } catch (e) {
+      console.warn(`[ownerFallback] ${attrName} failed:`, e.message || e);
+    }
+  }
+}
+
 async function fetchOwnersFromJira() {
-  // Reset cache để Refresh Owner luôn lấy mới.
   ownerNameToObject = {};
   ownerKeyToObject = {};
   ownerOptionsLoaded = false;
 
   const baseQ = `objectTypeId = ${OWNER_OBJECT_TYPE_ID}`;
   const total = await fetchTotalCount(baseQ).catch(() => 0);
+  const seen = new Map();
 
   console.log(`[ownerMap] total Users=${total}`);
+  toast(`Đang tải Owner list: ${total} users`, "warning");
 
-  let owners = [];
-
-  if (total > 0 && total < API_LIMIT) {
-    owners = await fetchOwnersUnderLimit(baseQ);
-  } else {
-    // Users >= 1000: chia theo attribute tên giống cách device chia theo Version OS.
-    // Thử nhiều field phổ biến vì schema Users có thể đặt tên attribute khác nhau.
-    const splitAttrs = [
-      "Name",
-      "Display Name",
-      "Full Name",
-      "Email",
-      "User principal name",
-      "Username",
-    ];
-
-    let best = { owners: [], rawFetched: 0, successBuckets: 0, attr: "" };
-
-    for (const attrName of splitAttrs) {
-      const result = await fetchOwnersSplitByAttribute(attrName);
-
-      if (result.owners.length > best.owners.length) {
-        best = { ...result, attr: attrName };
-      }
-
-      // Nếu đã lấy gần đủ total thì dừng.
-      if (total > 0 && result.owners.length >= total * 0.98) {
-        best = { ...result, attr: attrName };
-        break;
-      }
-    }
-
-    owners = best.owners;
-
-    console.log(`[ownerMap] USING OLD OWNER LOADER, selected attr="${best.attr}", unique=${owners.length}, raw=${best.rawFetched}, buckets=${best.successBuckets}`);
-
-    console.log(
-      `[ownerMap] split done attr="${best.attr}", total=${total}, unique=${owners.length}, raw=${best.rawFetched}, buckets=${best.successBuckets}`
-    );
-
-    if (total > 0 && owners.length < total) {
-      toast(`⚠ Owner loaded ${owners.length}/${total}. Nếu thiếu user, cần chỉnh split attribute cho Users schema.`, "warning");
-    }
+  try {
+    const keyOwners = await fetchOwnersByObjectKey();
+    rememberOwnerListIntoSeen(keyOwners, seen);
+    console.log(`[ownerMap] objectKey loaded=${keyOwners.length}, unique=${seen.size}`);
+  } catch (e) {
+    console.warn("[ownerMap] objectKey loader failed:", e.message || e);
   }
 
-  owners.forEach(o => rememberOwnerOption(o));
+  if (total === 0 || seen.size < total) {
+    await fetchOwnersFallbackMerge(seen, total);
+  }
 
+  if (!seen.size) {
+    const fallback = await fetchOwnersUnderLimit(baseQ);
+    rememberOwnerListIntoSeen(fallback, seen);
+  }
+
+  const owners = [...seen.values()];
+  owners.forEach(o => rememberOwnerOption(o));
   ownerOptionsLoaded = owners.length > 0;
-  console.log(`[ownerMap] loaded ${owners.length} owners`);
+
+  console.log(`[ownerMap] FINAL loaded=${owners.length}, total=${total}`);
+
+  if (total > 0 && owners.length < total) {
+    toast(`⚠ Owner loaded ${owners.length}/${total}. Xem log [ownerKey] để tìm bucket thiếu.`, "warning");
+  } else {
+    toast(`Owner loaded đầy đủ: ${owners.length}/${total}`, "success");
+  }
 
   return owners;
 }
@@ -1786,22 +1830,26 @@ async function loadOwnerMapFromMetadataSheet() {
 }
 
 async function ensureOwnerMap(forceApiLoad = false) {
+  if (forceApiLoad) {
+    ownerNameToObject = {};
+    ownerKeyToObject = {};
+    ownerOptionsLoaded = false;
+
+    toast("Đang tải lại toàn bộ Owner list từ Jira...", "warning");
+    await fetchOwnersFromJira();
+
+    if (!ownerOptionsLoaded) {
+      throw new Error("Không load được Owner list từ Jira. Kiểm tra objectTypeId Users hoặc quyền Assets API.");
+    }
+    return;
+  }
+
   if (ownerOptionsLoaded && getCachedOwnerNamesArray().length > 0) return;
 
-  // Ưu tiên đọc cache từ _SYS_OWNER_METADATA để Update Jira không tự tải 13k users.
   const loadedFromSheet = await loadOwnerMapFromMetadataSheet();
   if (loadedFromSheet) return;
 
-  if (!forceApiLoad) {
-    throw new Error('Owner list chưa được tải. Hãy bấm "Refresh Metadata" trước khi Update/Create Owner.');
-  }
-
-  toast("Đang tải Owner list từ Jira...", "warning");
-  await fetchOwnersFromJira();
-
-  if (!ownerOptionsLoaded) {
-    throw new Error("Không load được Owner list từ Jira. Kiểm tra objectTypeId Users hoặc quyền Assets API.");
-  }
+  throw new Error('Owner list chưa được tải. Hãy bấm "Refresh Metadata" trước khi Update/Create Owner.');
 }
 
 async function ensureOwnerMetadataSheet(context) {
@@ -1825,13 +1873,15 @@ async function writeOwnerMetadataSheet(context) {
   const used = sheet.getUsedRangeOrNullObject(true);
   await context.sync();
 
-  if (!used.isNullObject) used.clear(Excel.ClearApplyTo.all);
+  if (!used.isNullObject) {
+    used.clear(Excel.ClearApplyTo.all);
+    await context.sync();
+  }
 
   sheet.getRangeByIndexes(0, 0, 1, 4).values = [["Owner Name", "Owner ID", "Owner Key", "Username"]];
 
   const ownerItems = [];
   const seenKeys = new Set();
-
   Object.values(ownerNameToObject).forEach(o => {
     const k = String(o?.id || o?.key || o?.label || "").trim();
     if (!k || seenKeys.has(k)) return;
@@ -1840,20 +1890,20 @@ async function writeOwnerMetadataSheet(context) {
   });
 
   ownerItems.sort((a, b) => String(a.label || "").localeCompare(String(b.label || "")));
+  const rows = ownerItems.map(o => [o.label || "", o.id || "", o.key || "", o.username || ""]);
 
-  const rows = ownerItems.map(o => [
-    o.label || "",
-    o.id || "",
-    o.key || "",
-    o.username || "",
-  ]);
-
-  console.log(`[ownerMap] metadata sheet rows=${rows.length}`);
-  sheet.getRangeByIndexes(1, 0, rows.length, 4).values = rows;
+  const CHUNK = 1000;
+  for (let start = 0; start < rows.length; start += CHUNK) {
+    const chunk = rows.slice(start, start + CHUNK);
+    sheet.getRangeByIndexes(start + 1, 0, chunk.length, 4).values = chunk;
+    await context.sync();
+    console.log(`[ownerMap] metadata written=${Math.min(start + chunk.length, rows.length)}/${rows.length}`);
+  }
 
   try { sheet.visibility = Excel.SheetVisibility.hidden; } catch (_) {}
   await context.sync();
 
+  console.log(`[ownerMap] metadata sheet rows=${rows.length}`);
   return `='${OWNER_METADATA_SHEET}'!$A$2:$A$${rows.length + 1}`;
 }
 
