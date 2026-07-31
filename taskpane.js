@@ -1,5 +1,3 @@
-
-
 "use strict";
 
 // ── COLUMN MAP ────────────────────────────────────────────────
@@ -1031,6 +1029,61 @@ function applyJiraData(existingRow, asset, now) {
 //   - Ưu tiên theo Asset ID (byId)
 //   - Fallback theo Serial (bySerial)
 // ══════════════════════════════════════════════════════════════
+// ── SCALE HELPERS (dùng riêng cho writeLocationSheet, tối ưu 10.000+ dòng) ──
+
+// Gom các dòng cần xóa (đã sort GIẢM DẦN, unique) thành các block liên tục,
+// để mỗi block chỉ cần 1 lệnh entire-row delete thay vì N lệnh riêng lẻ.
+function groupContiguousDescending(sortedDescRows) {
+  const groups = [];
+  let i = 0;
+  while (i < sortedDescRows.length) {
+    let j = i;
+    while (
+      j + 1 < sortedDescRows.length &&
+      sortedDescRows[j] - sortedDescRows[j + 1] === 1
+    ) {
+      j++;
+    }
+    groups.push({
+      start: sortedDescRows[i],                         // dòng lớn nhất trong block
+      count: sortedDescRows[i] - sortedDescRows[j] + 1,  // số dòng liên tục
+    });
+    i = j + 1;
+  }
+  return groups;
+}
+
+// Gom các row update (đã sort TĂNG DẦN theo excelRow) thành block liên tục,
+// để ghi bằng 1 lần set values cho nhiều dòng, thay vì set từng dòng riêng lẻ.
+function groupContiguousUpdates(sortedUpdateRows) {
+  const groups = [];
+  let i = 0;
+  while (i < sortedUpdateRows.length) {
+    let j = i;
+    while (
+      j + 1 < sortedUpdateRows.length &&
+      sortedUpdateRows[j + 1].excelRow - sortedUpdateRows[j].excelRow === 1
+    ) {
+      j++;
+    }
+    groups.push({
+      startRow: sortedUpdateRows[i].excelRow,
+      rows: sortedUpdateRows.slice(i, j + 1).map(u => u.data),
+    });
+    i = j + 1;
+  }
+  return groups;
+}
+
+// Chia mảng thành chunk cố định — dùng để sync định kỳ khi thao tác trên
+// khối lượng lớn (10.000+ dòng), tránh dồn 1 queue Excel.run quá lớn khiến
+// Task Pane treo/trắng màn hình hoặc request bị Office từ chối vì quá tải.
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, allAssetById = null) {
   await Excel.run(async (context) => {
     const sheet = await ensureSheet(context, sheetName);
@@ -1072,11 +1125,18 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
       updatedIdx.add(idx);
     });
 
-    for (const { excelRow, data } of updateRows) {
-      sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT).values = [data];
-    }
+    // ── UPDATE ─────────────────────────────────────────────────
+    // Ghi theo block liên tục (giảm số request), chunk + sync định kỳ cho
+    // sheet lớn để không dồn quá nhiều thao tác vào 1 lần Excel.run.
+    updateRows.sort((a, b) => a.excelRow - b.excelRow);
+    const updateGroups = groupContiguousUpdates(updateRows);
 
-    if (updateRows.length > 0) await context.sync();
+    for (const chunk of chunkArray(updateGroups, 500)) {
+      for (const g of chunk) {
+        sheet.getRangeByIndexes(g.startRow, 0, g.rows.length, COL_COUNT).values = g.rows;
+      }
+      if (chunk.length > 0) await context.sync();
+    }
 
     const validationUpdates = [];
     const rowsToDeleteBecauseMoved = [];
@@ -1123,32 +1183,41 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
         rowsToDeleteBecauseMissing.push(idx + 1);
       });
 
-      for (const u of validationUpdates) {
-        const cell = sheet.getRangeByIndexes(u.excelRow, COL.VALIDATION, 1, 1);
-        cell.values = [[u.value]];
-        if (u.value === "Not in Jira") {
-          cell.format.font.color = "#f59e0b";
-        } else {
-          cell.format.font.color = "#111827";
+      // Ghi validation theo chunk, tránh queue quá lớn với 10.000+ dòng
+      for (const chunk of chunkArray(validationUpdates, 1000)) {
+        for (const u of chunk) {
+          const cell = sheet.getRangeByIndexes(u.excelRow, COL.VALIDATION, 1, 1);
+          cell.values = [[u.value]];
+          cell.format.font.color = u.value === "Not in Jira" ? "#f59e0b" : "#111827";
         }
+        if (chunk.length > 0) await context.sync();
       }
 
-      if (validationUpdates.length > 0) await context.sync();
-
-      // Delete stale rows from old location sheets or rows removed from Jira.
-      // Delete from bottom to top so Excel row indexes do not shift.
+      // ── DELETE ─────────────────────────────────────────────────
+      // QUAN TRỌNG: dùng getEntireRow().delete() thay vì xóa range 32 cột
+      // (COL_COUNT). Nếu chỉ xóa 32 cột đầu, các cột custom của user nằm
+      // ngoài COL_COUNT KHÔNG bị shift theo, khiến dữ liệu custom lệch dòng
+      // vĩnh viễn sau mỗi lần xóa và gây lỗi khi sheet có AutoFilter đang bật.
+      // Xóa nguyên hàng đảm bảo mọi cột — kể cả cột custom — luôn đồng bộ.
       const rowsToDelete = [...new Set([
         ...rowsToDeleteBecauseMoved,
         ...rowsToDeleteBecauseMissing,
-      ])].sort((a, b) => b - a);
+      ])].sort((a, b) => b - a); // giảm dần để row index không đổi khi xóa từ dưới lên
 
-      for (const excelRow of rowsToDelete) {
-        sheet.getRangeByIndexes(excelRow, 0, 1, COL_COUNT)
-          .delete(Excel.DeleteShiftDirection.up);
+      const deleteGroups = groupContiguousDescending(rowsToDelete);
+
+      for (const chunk of chunkArray(deleteGroups, 300)) {
+        for (const g of chunk) {
+          const topRow = g.start - g.count + 1;
+          sheet.getRangeByIndexes(topRow, 0, g.count, 1)
+            .getEntireRow()
+            .delete(Excel.DeleteShiftDirection.up);
+        }
+        if (chunk.length > 0) await context.sync();
       }
-      if (rowsToDelete.length > 0) await context.sync();
     }
 
+    // ── INSERT ─────────────────────────────────────────────────
     const toInsert = assets.filter(a => {
       const id = String(a.id || "").trim();
       const ser = String(a.serial || "").trim().toUpperCase();
@@ -1171,10 +1240,13 @@ async function writeLocationSheet(sheetName, assets, now, allKnownIds = null, al
         nextRow = used.rowCount;
       }
 
-      sheet.getRangeByIndexes(nextRow, 0, toInsert.length, COL_COUNT).values =
-        toInsert.map(a => buildNewRow(a, now));
-
-      await context.sync();
+      // Ghi theo chunk để tránh 1 lần set values quá lớn khi insert 10.000+ asset mới
+      for (const chunk of chunkArray(toInsert, 2000)) {
+        sheet.getRangeByIndexes(nextRow, 0, chunk.length, COL_COUNT).values =
+          chunk.map(a => buildNewRow(a, now));
+        nextRow += chunk.length;
+        await context.sync();
+      }
     }
 
     await hideSystemColumns(context, sheet);
